@@ -1,0 +1,261 @@
+"""Configuration and utilities for tailshare.
+
+This module handles:
+- Application paths (config, data, logs)
+- Configuration file management (YAML-based)
+- Logging setup
+- Utility functions
+"""
+
+import logging
+import os
+import pathlib
+from typing import Any
+from pathlib import Path
+
+import yaml
+
+
+class Config:
+    """Application configuration manager.
+    
+    Handles loading, saving, and accessing configuration settings.
+    Configuration is stored in ~/.config/tailshare/config.yaml
+    """
+    
+    DEFAULT_CONFIG: dict[str, Any] = {
+        "ssh": {
+            "key_paths": [],  # Empty list means use default SSH keys
+            "timeout": 30,
+            "port": 22,
+        },
+        "ui": {
+            "refresh_interval": 5,  # seconds
+        },
+        "transfer": {
+            "show_hidden_files": False,
+        },
+    }
+    
+    def __init__(self) -> None:
+        """Initialize configuration with defaults."""
+        self._config: dict[str, Any] = {}
+        self._config_path: Path = self._get_config_path()
+        self._load_config()
+    
+    def _get_config_path(self) -> Path:
+        """Get the configuration file path.
+        
+        Returns:
+            Path to the config file (default: ~/.config/tailshare/config.yaml)
+        """
+        config_dir = Path.home() / ".config" / "tailshare"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        return config_dir / "config.yaml"
+    
+    def _get_log_path(self) -> Path:
+        """Get the log file path.
+        
+        Returns:
+            Path to the log file (default: ~/.tailscale_share/log.txt)
+        """
+        log_dir = Path.home() / ".tailscale_share"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return log_dir / "log.txt"
+    
+    def _load_config(self) -> None:
+        """Load configuration from file or use defaults."""
+        self._config = self.DEFAULT_CONFIG.copy()
+        
+        if self._config_path.exists():
+            try:
+                with open(self._config_path, "r") as f:
+                    file_config = yaml.safe_load(f)
+                    if file_config:
+                        self._merge_config(self._config, file_config)
+            except (yaml.YAMLError, OSError) as e:
+                logging.warning(f"Failed to load config file: {e}. Using defaults.")
+    
+    def _merge_config(self, base: dict[str, Any], override: dict[str, Any]) -> None:
+        """Recursively merge override config into base config.
+        
+        Args:
+            base: Base configuration dictionary (modified in place)
+            override: Override configuration dictionary
+        """
+        for key, value in override.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                self._merge_config(base[key], value)
+            else:
+                base[key] = value
+    
+    def save_config(self) -> None:
+        """Save current configuration to file."""
+        try:
+            with open(self._config_path, "w") as f:
+                yaml.dump(self._config, f, default_flow_style=False, sort_keys=False)
+        except OSError as e:
+            logging.error(f"Failed to save config file: {e}")
+            raise
+    
+    def get(self, *keys: str, default: Any = None) -> Any:
+        """Get a configuration value by key path.
+        
+        Args:
+            *keys: Dot-separated key path (e.g., "ssh", "key_paths")
+            default: Default value if key not found
+        
+        Returns:
+            Configuration value or default
+        """
+        value: Any = self._config
+        for key in keys:
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+            else:
+                return default
+        return value
+    
+    def set(self, key_path: str, value: Any) -> None:
+        """Set a configuration value by key path.
+        
+        Args:
+            key_path: Dot-separated key path (e.g., "ssh.key_paths")
+            value: Value to set
+        """
+        keys = key_path.split(".")
+        current = self._config
+        for key in keys[:-1]:
+            if key not in current:
+                current[key] = {}
+            current = current[key]
+        current[keys[-1]] = value
+    
+    def get_ssh_key_paths(self) -> list[str]:
+        """Get SSH key paths from configuration.
+        
+        Returns empty list if no custom keys configured, indicating
+        that default SSH keys should be used.
+        
+        Returns:
+            List of SSH key paths (empty for defaults)
+        """
+        return self.get("ssh", "key_paths", default=[])
+    
+    def get_ssh_timeout(self) -> int:
+        """Get SSH connection timeout in seconds.
+        
+        Returns:
+            SSH timeout in seconds (default: 30)
+        """
+        return self.get("ssh", "timeout", default=30)
+    
+    def get_ssh_port(self) -> int:
+        """Get SSH port number.
+        
+        Returns:
+            SSH port number (default: 22)
+        """
+        return self.get("ssh", "port", default=22)
+    
+    def get_refresh_interval(self) -> int:
+        """Get UI refresh interval in seconds.
+        
+        Returns:
+            Refresh interval in seconds (default: 5)
+        """
+        return self.get("ui", "refresh_interval", default=5)
+    
+    def should_show_hidden_files(self) -> bool:
+        """Check if hidden files should be shown in file browser.
+        
+        Returns:
+            True if hidden files should be shown
+        """
+        return self.get("transfer", "show_hidden_files", default=False)
+
+
+# Global config instance
+_config: Config | None = None
+
+
+def get_config() -> Config:
+    """Get the global configuration instance.
+    
+    Returns:
+        Global Config instance (creates if needed)
+    """
+    global _config
+    if _config is None:
+        _config = Config()
+    return _config
+
+
+def setup_logging() -> None:
+    """Set up application logging.
+    
+    Creates log file at ~/.tailscale_share/log.txt and configures
+    logging to write to both file and console.
+    """
+    log_path = get_config()._get_log_path()
+    
+    # Create log directory if needed
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Configure root logger
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler(),
+        ],
+    )
+    
+    # Reduce verbosity for external libraries
+    logging.getLogger("paramiko").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+
+def validate_file_path(path: str) -> str:
+    """Validate a file path to prevent directory traversal attacks.
+    
+    Args:
+        path: File path to validate
+        
+    Returns:
+        Normalized absolute path
+        
+    Raises:
+        ValueError: If path contains directory traversal sequences
+    """
+    # Normalize path
+    normalized = os.path.normpath(path)
+    
+    # Check for directory traversal attempts
+    if ".." in normalized.split(os.sep):
+        raise ValueError(f"Invalid path: directory traversal detected: {path}")
+    
+    # Convert to absolute path
+    if not os.path.isabs(normalized):
+        normalized = os.path.abspath(normalized)
+    
+    return normalized
+
+
+def expand_path(path: str) -> str:
+    """Expand a path, handling ~ and environment variables.
+    
+    Args:
+        path: Path to expand
+        
+    Returns:
+        Expanded absolute path
+    """
+    # Expand ~ and environment variables
+    expanded = os.path.expanduser(os.path.expandvars(path))
+    
+    # Normalize the path
+    normalized = os.path.normpath(expanded)
+    
+    return normalized
