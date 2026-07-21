@@ -10,8 +10,10 @@ This module handles:
 import logging
 import os
 import pathlib
+import getpass
 from typing import Any
 from pathlib import Path
+
 
 import yaml
 
@@ -26,6 +28,7 @@ class Config:
     DEFAULT_CONFIG: dict[str, Any] = {
         "ssh": {
             "key_paths": [],  # Empty list means use default SSH keys
+            "user": None,     # Remote SSH username (None uses local user)
             "timeout": 30,
             "port": 22,
         },
@@ -131,6 +134,15 @@ class Config:
             current = current[key]
         current[keys[-1]] = value
     
+    def get_ssh_user(self) -> str:
+        """Get the SSH username from configuration.
+        
+        Returns:
+            SSH username (falls back to current local user)
+        """
+        user = self.get("ssh", "user", default=None)
+        return user if user else getpass.getuser()
+
     def get_ssh_key_paths(self) -> list[str]:
         """Get SSH key paths from configuration.
         
@@ -208,7 +220,6 @@ def setup_logging() -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[
             logging.FileHandler(log_path),
-            logging.StreamHandler(),
         ],
     )
     

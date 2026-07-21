@@ -158,13 +158,30 @@ class DeviceDiscovery:
         devices: list[Device] = []
         
         # Extract this device's IP
-        if "Self" in status_data and "PrimaryIPs" in status_data["Self"]:
-            ips = status_data["Self"]["PrimaryIPs"]
-            if ips:
-                self._self_ip = ips[0]
+        self_data = status_data.get("Self") or status_data.get("self")
+        if self_data:
+            self_ips = (
+                self_data.get("TailscaleIPs") or 
+                self_data.get("primary_ips") or 
+                self_data.get("PrimaryIPs") or 
+                self_data.get("ips") or 
+                self_data.get("IP") or 
+                self_data.get("ip")
+            )
+            if self_ips:
+                if isinstance(self_ips, list):
+                    self._self_ip = self_ips[0] if self_ips else ""
+                else:
+                    self._self_ip = self_ips
+
         
         # Parse peer devices
-        peers = status_data.get("Peers", [])
+        peers_data = status_data.get("Peer") or status_data.get("Peers") or status_data.get("peers", [])
+        
+        if isinstance(peers_data, dict):
+            peers = peers_data.values()
+        else:
+            peers = peers_data
         
         for peer in peers:
             try:
@@ -187,33 +204,48 @@ class DeviceDiscovery:
         Returns:
             Device instance or None if parsing fails
         """
-        # Get IP addresses
-        ips = peer.get("PrimaryIPs", [])
-        if not ips:
+        # Get IP addresses - try multiple possible keys, handle both list and string
+        ip_data = (
+            peer.get("TailscaleIPs") or 
+            peer.get("PrimaryIPs") or 
+            peer.get("primary_ips") or 
+            peer.get("IPs") or 
+            peer.get("ips") or 
+            peer.get("IP") or 
+            peer.get("ip")
+        )
+        
+        if not ip_data:
             return None
         
-        ip = ips[0]
+        if isinstance(ip_data, list):
+            ip = ip_data[0] if ip_data else None
+        else:
+            ip = ip_data
+            
+        if not ip:
+            return None
         
         # Skip if this is ourself
         if ip == self._self_ip:
             return None
         
-        # Get device name and hostname
-        name = peer.get("Name", "unknown")
-        hostname = peer.get("HostName", name)
+        # Get device name and hostname - try multiple possible keys
+        name = peer.get("Name") or peer.get("name") or peer.get("HostName") or peer.get("hostname") or "unknown"
+        hostname = peer.get("HostName") or peer.get("hostname") or name
         
         # Remove .tailnet.com suffix from name if present
         if "." in name:
             name = name.split(".")[0]
         
-        # Check online status
-        online = peer.get("Online", False)
+        # Check online status - try multiple possible keys
+        online = peer.get("Online") if "Online" in peer else peer.get("online", False)
         
-        # Get last seen time
-        last_seen = peer.get("LastSeen")
+        # Get last seen time - try multiple possible keys
+        last_seen = peer.get("LastSeen") or peer.get("last_seen")
         
-        # Get machine ID
-        machine_id = peer.get("ID", "")
+        # Get machine ID - try multiple possible keys
+        machine_id = peer.get("ID") or peer.get("id", "")
         
         return Device(
             name=name,

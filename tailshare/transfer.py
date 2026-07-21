@@ -82,6 +82,8 @@ class TransferTask:
         error: Error message if failed
         started_at: Transfer start time
         completed_at: Transfer completion time
+        username: SSH username for authentication
+        password: SSH password for authentication
     """
     
     source_path: str
@@ -92,6 +94,8 @@ class TransferTask:
     error: str | None = None
     started_at: float | None = None
     completed_at: float | None = None
+    username: str | None = None
+    password: str | None = None
     
     def start(self) -> None:
         """Mark transfer as started."""
@@ -144,8 +148,12 @@ class SFTPClient:
         self._logger = logging.getLogger(__name__)
         self._config = get_config()
     
-    def connect(self) -> None:
+    def connect(self, username: str | None = None, password: str | None = None) -> None:
         """Establish SSH/SFTP connection.
+        
+        Args:
+            username: SSH username to use. If None, fallback to config/local.
+            password: SSH password to use. If None, use key/agent.
         
         Raises:
             TransferError: If connection fails
@@ -156,45 +164,37 @@ class SFTPClient:
                 paramiko.AutoAddPolicy()
             )
             
-            # Get SSH key paths
-            key_paths = self._config.get_ssh_key_paths()
+            # Determine username
+            ssh_user = username or self._config.get_ssh_user()
             
             # Prepare authentication
-            auth_kwargs: dict[str, Any] = {}
+            auth_kwargs: dict[str, Any] = {"username": ssh_user}
             
+            # Only set key_filename if explicitly provided in config.
+            key_paths = self._config.get_ssh_key_paths()
             if key_paths:
-                # Use custom key paths
                 for key_path in key_paths:
                     expanded_path = expand_path(key_path)
                     if os.path.exists(expanded_path):
-                        try:
-                            auth_kwargs["key_filename"] = expanded_path
-                            break
-                        except paramiko.SSHException:
-                            continue
-            else:
-                # Use default SSH keys
-                default_keys = [
-                    os.path.expanduser("~/.ssh/id_rsa"),
-                    os.path.expanduser("~/.ssh/id_ed25519"),
-                    os.path.expanduser("~/.ssh/id_ecdsa"),
-                    os.path.expanduser("~/.ssh/id_dsa"),
-                ]
-                
-                for key_path in default_keys:
-                    if os.path.exists(key_path):
-                        auth_kwargs["key_filename"] = key_path
+                        auth_kwargs["key_filename"] = expanded_path
                         break
             
-            if "key_filename" not in auth_kwargs:
-                raise TransferError(
-                    "No SSH keys found. Please configure SSH key authentication."
-                )
+            if password:
+                auth_kwargs["password"] = password
+
+            # Logging authentication attempt (masking password)
+            auth_method = "Password" if password else "Key/Agent"
+            self._logger.info(
+                f"Attempting connection to {self._device.ip} as '{ssh_user}' "
+                f"using {auth_method}"
+            )
             
             self._ssh_client.connect(
                 hostname=self._device.ip,
                 port=self._config.get_ssh_port(),
                 timeout=self._config.get_ssh_timeout(),
+                allow_agent=True,
+                look_for_keys=True,
                 **auth_kwargs,
             )
             
@@ -362,18 +362,20 @@ class SFTPClient:
             
             self._sftp_client.mkdir(path)
     
-    def test_connection(self) -> bool:
+    def test_connection(self) -> tuple[bool, str]:
         """Test if connection to device is possible.
         
         Returns:
-            True if connection successful
+            Tuple of (success, message)
         """
         try:
             self.connect()
             self.disconnect()
-            return True
-        except TransferError:
-            return False
+            return True, "Connection successful"
+        except TransferError as e:
+            return False, str(e)
+        except Exception as e:
+            return False, f"Unexpected error: {e}"
 
 
 class TransferManager:
@@ -399,6 +401,8 @@ class TransferManager:
         target_path: str,
         device: Device,
         is_folder: bool = False,
+        username: str | None = None,
+        password: str | None = None,
     ) -> TransferTask:
         """Queue a file/folder transfer.
         
@@ -407,6 +411,8 @@ class TransferManager:
             target_path: Remote path destination
             device: Target device
             is_folder: True if transferring a folder
+            username: SSH username for authentication
+            password: SSH password for authentication
             
         Returns:
             Created transfer task
@@ -423,6 +429,8 @@ class TransferManager:
             target_path=target_path,
             device=device,
             progress=progress,
+            username=username,
+            password=password,
         )
         
         with self._lock:
@@ -504,7 +512,13 @@ class TransferManager:
             client = SFTPClient(device)
             
             try:
-                client.connect()
+                # Connect using the first task's credentials for this device
+                # (Assuming same credentials for all tasks to the same device in one batch)
+                first_task = tasks[0]
+                client.connect(
+                    username=first_task.username, 
+                    password=first_task.password
+                )
                 
                 for task in tasks:
                     try:
@@ -557,20 +571,28 @@ class TransferManager:
         """
         task.progress = progress
     
-    def test_device_connection(self, device: Device) -> tuple[bool, str]:
+    def test_device_connection(
+        self, 
+        device: Device, 
+        username: str | None = None, 
+        password: str | None = None
+    ) -> tuple[bool, str]:
         """Test connection to a device.
         
         Args:
             device: Device to test
+            username: SSH username for authentication
+            password: SSH password for authentication
             
         Returns:
             Tuple of (success, message)
         """
         client = SFTPClient(device)
         try:
-            if client.test_connection():
-                return True, "Connection successful"
-            else:
-                return False, "Connection failed"
+            client.connect(username=username, password=password)
+            client.disconnect()
+            return True, "Connection successful"
         except TransferError as e:
             return False, str(e)
+        except Exception as e:
+            return False, f"Unexpected error: {e}"

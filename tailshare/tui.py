@@ -163,6 +163,14 @@ class FileBrowser(Static):
         
         return "\n".join(lines)
     
+    def on_click(self, event: events.Click) -> None:
+        """Handle click events to select entries."""
+        # The first two lines are "Path: ..." and an empty line
+        index = event.y - 2
+        if 0 <= index < len(self._entries):
+            self._cursor_index = index
+            self.action_select()
+
     def _update_display(self) -> None:
         """Update the display."""
         self.refresh()
@@ -246,6 +254,10 @@ class TailshareApp(App[None]):
         margin: 1;
     }
     
+    #device-auth {
+        margin: 1 0;
+    }
+    
     #right-panel {
         width: 40%;
         height: 1fr;
@@ -258,11 +270,11 @@ class TailshareApp(App[None]):
     }
     
     #file-browser {
-        height: 50%;
+        height: 1fr;
     }
     
     #transfer-queue {
-        height: 50%;
+        height: 1fr;
     }
     
     .status-bar {
@@ -309,6 +321,16 @@ class TailshareApp(App[None]):
             with Vertical(id="left-panel"):
                 yield Label("[b]Tailscale Devices[/b]", id="device-header")
                 yield DataTable(id="device-list")
+                with Vertical(id="device-auth"):
+                    yield Input(
+                        placeholder="Username (optional)",
+                        id="remote-user",
+                    )
+                    yield Input(
+                        placeholder="Password (optional)",
+                        id="remote-password",
+                        password=True,
+                    )
                 with Horizontal(id="device-controls"):
                     yield Button("Refresh", id="btn-refresh-devices", variant="primary")
                     yield Button("Test", id="btn-test-device", variant="default")
@@ -354,17 +376,30 @@ class TailshareApp(App[None]):
             self._update_queue_display()
     
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Handle device selection."""
-        if event.column_key == "name":
-            device_name = event.value
-            self._selected_device = self._device_discovery.get_device_by_name(
-                str(device_name)
+        """Handle device selection via row selection."""
+        device_name = str(event.row_key.value)
+        self._select_device_by_name(device_name)
+
+    def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
+        """Handle device selection via cell click."""
+        device_name = str(event.cell_key.row_key.value)
+        self._select_device_by_name(device_name)
+
+    def _select_device_by_name(self, name: str) -> None:
+        """Helper to select a device and notify the user."""
+        device = self._device_discovery.get_device_by_name(name)
+        if device:
+            self._selected_device = device
+            self.notify(
+                f"Selected {device.name}",
+                title="Device Selected",
             )
-            if self._selected_device:
-                self.notify(
-                    f"Selected {self._selected_device.name}",
-                    title="Device Selected",
-                )
+        else:
+            self.notify(
+                f"Could not find device: {name}",
+                title="Error",
+                severity="error",
+            )
     
     def on_file_browser_file_selected(self, event: FileBrowser.FileSelected) -> None:
         """Handle file selection from browser."""
@@ -443,8 +478,13 @@ class TailshareApp(App[None]):
             self.notify("No device selected", title="Warning", severity="warning")
             return
         
+        user = self.query_one("#remote-user", Input).value.strip() or None
+        password = self.query_one("#remote-password", Input).value.strip() or None
+
         success, message = self._transfer_manager.test_device_connection(
-            self._selected_device
+            self._selected_device,
+            username=user,
+            password=password,
         )
         
         if success:
@@ -485,7 +525,10 @@ class TailshareApp(App[None]):
             )
             return
         
-        # Get remote path
+        # Get credentials and remote path
+        user = self.query_one("#remote-user", Input).value.strip() or None
+        password = self.query_one("#remote-password", Input).value.strip() or None
+        
         remote_path_input = self.query_one("#remote-path", Input)
         remote_path = remote_path_input.value.strip()
         if not remote_path:
@@ -499,6 +542,8 @@ class TailshareApp(App[None]):
                 remote_path,
                 self._selected_device,
                 is_folder,
+                username=user,
+                password=password,
             )
             
             self.notify(
