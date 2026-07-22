@@ -356,7 +356,8 @@ class TailshareApp(App[None]):
     ]
     
     TITLE = "Tailshare"
-    SUB_TITLE = "File Sharing over Tailscale"
+    VERSION = "v1.0"
+    SUB_TITLE = f"File Sharing over Tailscale ({VERSION})"
     
     def __init__(self) -> None:
         super().__init__()
