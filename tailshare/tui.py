@@ -278,6 +278,12 @@ class TailshareApp(App[None]):
     #device-list {
         height: 1fr;
     }
+
+    #device-list > .data-table__row--selected {
+        background: $accent;
+        color: $text;
+        text-style: bold;
+    }
     
     #file-browser-container {
         height: 2fr;
@@ -320,6 +326,7 @@ class TailshareApp(App[None]):
         self._device_discovery = DeviceDiscovery()
         self._transfer_manager = TransferManager()
         self._selected_device: Device | None = None
+        self._selected_device_name: str | None = None
         self._selected_path: str = ""
         self._worker: Worker | None = None
     
@@ -403,6 +410,9 @@ class TailshareApp(App[None]):
         device = self._device_discovery.get_device_by_name(name)
         if device:
             self._selected_device = device
+            self._selected_device_name = name
+            self._refresh_device_list()
+            
             self.notify(
                 f"Selected {device.name}",
                 title="Device Selected",
@@ -457,10 +467,18 @@ class TailshareApp(App[None]):
             
             for device in devices:
                 status = "Online" if device.online else "Offline"
+                
+                # Apply highlight if this is the selected recipient
+                style_prefix = ""
+                style_suffix = ""
+                if self._selected_device_name == device.name:
+                    style_prefix = "[background=$primary][color=$text][b]"
+                    style_suffix = "[/]"
+                
                 device_list.add_row(
-                    device.name,
-                    device.ip,
-                    status,
+                    f"{style_prefix}{device.name}{style_suffix}",
+                    f"{style_prefix}{device.ip}{style_suffix}",
+                    f"{style_prefix}{status}{style_suffix}",
                     key=device.name,
                 )
             
