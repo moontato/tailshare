@@ -323,7 +323,7 @@ class TailshareApp(App[None]):
     }
     
     #transfer-queue-container {
-        height: 1fr;
+        height: 4fr;
     }
     
     #transfer-queue {
