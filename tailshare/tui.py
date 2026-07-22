@@ -35,7 +35,7 @@ from tailshare.transfer import TransferManager, TransferTask, TransferError
 from tailshare.config import get_config, setup_logging, expand_path
 
 
-class FileBrowser(Static):
+class FileBrowser(Vertical):
     """File browser widget for selecting files/folders to transfer."""
     
     can_focus = True
@@ -55,13 +55,17 @@ class FileBrowser(Static):
     ) -> None:
         super().__init__(*args, **kwargs)
         self._path = path
-        self._cursor_index = 0
         self._entries: list[tuple[str, bool]] = []  # (name, is_directory)
     
     @property
     def path(self) -> str:
         """Current directory path."""
         return self._path
+    
+    def compose(self) -> ComposeResult:
+        """Compose the file browser layout."""
+        yield Label(id="path-label")
+        yield DataTable(id="file-table")
     
     def on_mount(self) -> None:
         """Refresh file list when mounted."""
@@ -86,57 +90,49 @@ class FileBrowser(Static):
             
             for entry in entries:
                 self._entries.append((entry.name, entry.is_dir()))
-            
+                
         except PermissionError:
             self._entries = [("<Permission Denied>", True)]
         except Exception:
             self._entries = [("<Invalid Path>", True)]
+            
+        self._update_table()
+    
+    def _update_table(self) -> None:
+        """Update the DataTable with current entries."""
+        table = self.query_one("#file-table", DataTable)
+        table.clear()
+        
+        if not table.columns:
+            table.add_columns("Name")
+        
+        for name, is_dir in self._entries:
+            table.add_row(name, key=name)
+            
+        self.query_one("#path-label", Label).update(f"[b]Path:[/b] {self._path}")
     
     def navigate_down(self) -> None:
         """Navigate selection down."""
-        if self._entries:
-            self._cursor_index = min(
-                self._cursor_index + 1,
-                len(self._entries) - 1,
-            )
-            self._update_display()
+        table = self.query_one("#file-table", DataTable)
+        table.action_cursor_down()
     
     def navigate_up(self) -> None:
         """Navigate selection up."""
-        if self._entries:
-            self._cursor_index = max(0, self._cursor_index - 1)
-            self._update_display()
+        table = self.query_one("#file-table", DataTable)
+        table.action_cursor_up()
     
     def action_select(self) -> None:
-        """Select current entry."""
-        if not self._entries:
-            return
-        
-        name, is_dir = self._entries[self._cursor_index]
-        
-        if name == "..":
-            # Go to parent directory
-            self._path = str(Path(self._path).parent)
-            self._refresh_entries()
-            self._cursor_index = 0
-        elif is_dir:
-            # Enter directory
-            self._path = str(Path(self._path) / name)
-            self._refresh_entries()
-            self._cursor_index = 0
-        else:
-            # Select file - notify parent
-            self.post_message(
-                self.FileSelected(self._path, str(Path(self._path) / name))
-            )
-        
-        self._update_display()
-    
+        """Select current entry via keyboard."""
+        table = self.query_one("#file-table", DataTable)
+        if table.cursor_row is not None:
+            row_index = table.cursor_row
+            if 0 <= row_index < len(self._entries):
+                name, _ = self._entries[row_index]
+                self._handle_selection(name)
+
     def action_refresh(self) -> None:
         """Refresh file list."""
         self._refresh_entries()
-        self._cursor_index = 0
-        self._update_display()
         self.app.notify("Directory refreshed")
     
     class FileSelected(Message):
@@ -150,33 +146,43 @@ class FileBrowser(Static):
         def __hash__(self) -> int:
             return hash(self.file_path)
     
-    def render(self) -> str:
-        """Render the file browser."""
-        lines = [f"[b]Path:[/b] {self._path}"]
-        lines.append("")
-        
-        if not self._entries:
-            lines.append("[dim]Empty directory[/dim]")
-        else:
-            for i, (name, is_dir) in enumerate(self._entries):
-                prefix = "→ " if i == self._cursor_index else "  "
-                icon = "[bold blue][dir][/bold blue]" if is_dir else "[green][file][/green]"
-                lines.append(f"{prefix} {icon} {name}")
-        
-        return "\n".join(lines)
-    
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Handle row selection in the file table."""
+        self._handle_selection(str(event.row_key.value))
+        event.stop()
+
+    def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
+        """Handle cell selection in the file table."""
+        self._handle_selection(str(event.cell_key.row_key.value))
+        event.stop()
+
+    def _handle_selection(self, name: str) -> None:
+        """Process selection of a file or directory by name."""
+        try:
+            # Find entry index by name
+            index = next(i for i, (n, _) in enumerate(self._entries) if n == name)
+            _, is_dir = self._entries[index]
+            
+            if name == "..":
+                # Go to parent directory
+                self._path = str(Path(self._path).parent)
+                self._refresh_entries()
+            elif is_dir:
+                # Enter directory
+                self._path = str(Path(self._path) / name)
+                self._refresh_entries()
+            else:
+                # Select file - notify parent
+                self.post_message(
+                    self.FileSelected(self._path, str(Path(self._path) / name))
+                )
+        except StopIteration:
+            pass
+
     def on_click(self, event: events.Click) -> None:
         """Handle click events to select entries."""
         self.focus()
-        # The first two lines are "Path: ..." and an empty line
-        index = event.y - 2
-        if 0 <= index < len(self._entries):
-            self._cursor_index = index
-            self.action_select()
 
-    def _update_display(self) -> None:
-        """Update the display."""
-        self.refresh()
 
 
 class TransferQueue(Static):
@@ -288,9 +294,17 @@ class TailshareApp(App[None]):
     #file-browser-container {
         height: 2fr;
     }
+
+    #file-table {
+        height: 1fr;
+    }
+    
+    #transfer-queue-container {
+        height: 1fr;
+    }
     
     #transfer-queue {
-        height: 1fr;
+        height: auto;
     }
     
     .status-bar {
@@ -365,9 +379,10 @@ class TailshareApp(App[None]):
                     yield Button("Send", id="btn-send", variant="primary")
                 
                 yield Label("[b]Transfer Queue[/b]", id="queue-header")
-                yield TransferQueue(id="transfer-queue")
-        
-        yield Footer()
+                with ScrollableContainer(id="transfer-queue-container"):
+                    yield TransferQueue(id="transfer-queue")
+                
+                yield Footer()
     
     def on_mount(self) -> None:
         """Initialize app when mounted."""
@@ -397,13 +412,15 @@ class TailshareApp(App[None]):
     
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Handle device selection via row selection."""
-        device_name = str(event.row_key.value)
-        self._select_device_by_name(device_name)
+        if event.data_table.id == "device-list":
+            device_name = str(event.row_key.value)
+            self._select_device_by_name(device_name)
 
     def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
         """Handle device selection via cell click."""
-        device_name = str(event.cell_key.row_key.value)
-        self._select_device_by_name(device_name)
+        if event.data_table.id == "device-list":
+            device_name = str(event.cell_key.row_key.value)
+            self._select_device_by_name(device_name)
 
     def _select_device_by_name(self, name: str) -> None:
         """Helper to select a device and notify the user."""
