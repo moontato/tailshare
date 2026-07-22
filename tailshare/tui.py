@@ -29,6 +29,7 @@ from textual.binding import Binding
 from textual import events
 from textual.message import Message
 from textual.worker import Worker, WorkerState
+from textual.events import Resize
 
 from tailshare.devices import Device, DeviceDiscovery, TailscaleNotRunningError
 from tailshare.transfer import TransferManager, TransferTask, TransferError
@@ -56,6 +57,7 @@ class FileBrowser(Vertical):
         super().__init__(*args, **kwargs)
         self._path = path
         self._entries: list[tuple[str, bool]] = []  # (name, is_directory)
+        self._name_column_key: Any = None
     
     @property
     def path(self) -> str:
@@ -70,6 +72,22 @@ class FileBrowser(Vertical):
     def on_mount(self) -> None:
         """Refresh file list when mounted."""
         self._refresh_entries()
+        self.call_after_refresh(self._set_column_width)
+
+    def on_resize(self, event: Resize) -> None:
+        """Handle resize to update column width."""
+        self._set_column_width()
+
+    def _set_column_width(self) -> None:
+        """Set the Name column width to fill the table."""
+        table = self.query_one("#file-table", DataTable)
+        if table.columns and self._name_column_key:
+            column = table.columns.get(self._name_column_key)
+            if column:
+                available = table.container_size.width - 2 * table.cell_padding
+                column.width = max(available, 10)
+                column.auto_width = False
+                table.refresh()
     
     def _refresh_entries(self) -> None:
         """Refresh the file/directory listing."""
@@ -104,7 +122,7 @@ class FileBrowser(Vertical):
         table.clear()
         
         if not table.columns:
-            table.add_columns("Name")
+            self._name_column_key = table.add_column("Name")
         
         for name, is_dir in self._entries:
             table.add_row(name, key=name)
