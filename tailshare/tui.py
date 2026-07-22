@@ -38,6 +38,8 @@ from tailshare.config import get_config, setup_logging, expand_path
 class FileBrowser(Static):
     """File browser widget for selecting files/folders to transfer."""
     
+    can_focus = True
+    
     BINDINGS = [
         Binding("j", "navigate_down", "Down", show=False),
         Binding("k", "navigate_up", "Up", show=False),
@@ -165,6 +167,7 @@ class FileBrowser(Static):
     
     def on_click(self, event: events.Click) -> None:
         """Handle click events to select entries."""
+        self.focus()
         # The first two lines are "Path: ..." and an empty line
         index = event.y - 2
         if 0 <= index < len(self._entries):
@@ -404,7 +407,13 @@ class TailshareApp(App[None]):
     def on_file_browser_file_selected(self, event: FileBrowser.FileSelected) -> None:
         """Handle file selection from browser."""
         self._selected_path = event.file_path
-        self.notify(f"Selected: {event.file_path}", title="File Selected")
+        if self._selected_device:
+            self._send_files()
+        else:
+            self.notify(
+                f"Selected: {event.file_path}. Please select a target device to queue.",
+                title="File Selected",
+            )
     
     def action_refresh_devices(self) -> None:
         """Refresh device list."""
@@ -554,9 +563,9 @@ class TailshareApp(App[None]):
             self._update_queue_display()
             
             # Start transfer worker
-            self._worker = self.workers.run_worker(
+            self._worker = self.run_worker(
                 self._execute_transfers,
-                mode="thread",
+                thread=True,
             )
             
         except TransferError as e:
@@ -566,7 +575,7 @@ class TailshareApp(App[None]):
                 severity="error",
             )
     
-    async def _execute_transfers(self) -> None:
+    def _execute_transfers(self) -> None:
         """Execute queued transfers in background."""
         self._transfer_manager.execute_queue()
         self._update_queue_display()

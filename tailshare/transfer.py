@@ -245,6 +245,12 @@ class SFTPClient:
         # Validate source path
         source_path = validate_file_path(source_path)
         
+        # Use remote path as-is, but handle '~' as current remote directory
+        if target_path == "~":
+            target_path = "."
+        elif target_path.startswith("~"):
+            target_path = target_path.replace("~", ".", 1)
+            
         if not os.path.exists(source_path):
             raise TransferError(f"Source file not found: {source_path}")
         
@@ -264,10 +270,21 @@ class SFTPClient:
         if target_dir:
             self._ensure_remote_dir(target_dir)
         
+        # If target_path is a directory, append the filename to it
+        try:
+            sftp_stat = self._sftp_client.stat(target_path)
+            if stat.S_ISDIR(sftp_stat.st_mode):
+                target_path = os.path.join(target_path, os.path.basename(source_path))
+                self._logger.info(f"Target is directory, updating path to: {target_path}")
+        except (FileNotFoundError, IOError):
+            pass
+        
         # Transfer file with progress tracking
         start_time = time.time()
         
-        def progress_hook(transferred: int) -> None:
+        self._logger.info(f"SFTP PUT: {source_path} -> {target_path}")
+        
+        def progress_hook(transferred: int, total: int = None) -> None:
             progress.update(transferred, file_size)
             progress.update_speed(time.time() - start_time)
             if progress_callback:
@@ -354,13 +371,18 @@ class SFTPClient:
         
         try:
             self._sftp_client.stat(path)
-        except FileNotFoundError:
+        except (FileNotFoundError, IOError):
             # Create parent directories first
             parent = os.path.dirname(path)
             if parent and parent != path:
                 self._ensure_remote_dir(parent)
             
-            self._sftp_client.mkdir(path)
+            try:
+                self._sftp_client.mkdir(path)
+            except IOError as e:
+                self._logger.debug(f"mkdir failed for {path}: {e}")
+                # It might already exist or be a file; we'll let put() fail if so
+                pass
     
     def test_connection(self) -> tuple[bool, str]:
         """Test if connection to device is possible.
@@ -418,7 +440,9 @@ class TransferManager:
             Created transfer task
         """
         source_path = validate_file_path(source_path)
-        target_path = expand_path(target_path)
+        
+        # Target path should not be expanded locally as it's for the remote system
+        target_path = target_path
         
         progress = TransferProgress(
             filename=os.path.basename(source_path),
@@ -513,12 +537,17 @@ class TransferManager:
             
             try:
                 # Connect using the first task's credentials for this device
-                # (Assuming same credentials for all tasks to the same device in one batch)
                 first_task = tasks[0]
-                client.connect(
-                    username=first_task.username, 
-                    password=first_task.password
-                )
+                try:
+                    client.connect(
+                        username=first_task.username, 
+                        password=first_task.password
+                    )
+                except TransferError as e:
+                    self._logger.error(f"Connection failed for {device.name}: {e}")
+                    for task in tasks:
+                        task.fail(f"Connection failed: {e}")
+                    continue
                 
                 for task in tasks:
                     try:
@@ -548,9 +577,10 @@ class TransferManager:
                             f"Transfer failed: {task.source_path} - {e}"
                         )
                     except Exception as e:
-                        task.fail(f"Unexpected error: {e}")
+                        error_msg = f"Unexpected error ({type(e).__name__}): {e}"
+                        task.fail(error_msg)
                         self._logger.error(
-                            f"Transfer error: {task.source_path} - {e}"
+                            f"Transfer error: {task.source_path} - {error_msg}"
                         )
                 
             finally:
