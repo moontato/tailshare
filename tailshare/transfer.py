@@ -418,6 +418,7 @@ class TransferManager:
         self._logger = logging.getLogger(__name__)
         self._lock = threading.Lock()
         self._current_client: SFTPClient | None = None
+        self._progress_callback: Any = None
     
     def queue_transfer(
         self,
@@ -507,6 +508,14 @@ class TransferManager:
         """
         with self._lock:
             return self._tasks.copy()
+    
+    def set_progress_callback(self, callback: Any) -> None:
+        """Set callback to invoke when progress changes.
+        
+        Args:
+            callback: Function to call with the updated task
+        """
+        self._progress_callback = callback
     
     def execute_queue(self) -> None:
         """Execute all pending transfers in queue.
@@ -602,6 +611,8 @@ class TransferManager:
             progress: New progress state
         """
         task.progress = progress
+        if self._progress_callback:
+            self._progress_callback(task)
     
     def test_device_connection(
         self, 

@@ -217,7 +217,7 @@ class TransferQueue(Static):
             tasks: List of current transfer tasks
         """
         self._tasks = tasks
-        self.refresh()
+        self.update(self.render())
     
     def render(self) -> str:
         """Render the transfer queue."""
@@ -362,10 +362,12 @@ class TailshareApp(App[None]):
         super().__init__()
         self._device_discovery = DeviceDiscovery()
         self._transfer_manager = TransferManager()
+        self._transfer_manager.set_progress_callback(self._on_transfer_progress)
         self._selected_device: Device | None = None
         self._selected_device_name: str | None = None
         self._selected_path: str = ""
         self._worker_running = False
+        self._queue_update_enabled: bool = False
     
     def compose(self) -> ComposeResult:
         """Compose the UI layout."""
@@ -403,7 +405,6 @@ class TailshareApp(App[None]):
                     )
                     yield Button("Send", id="btn-send", variant="primary")
                 
-                yield Label("[b]Transfer Queue[/b]", id="queue-header")
                 with ScrollableContainer(id="transfer-queue-container"):
                     yield TransferQueue(id="transfer-queue")
                 
@@ -637,6 +638,8 @@ class TailshareApp(App[None]):
                     self._execute_transfers,
                     thread=True,
                 )
+                self._queue_update_enabled = True
+                self.set_interval(0.5, self._update_queue_display)
             
         except TransferError as e:
             self.notify(
@@ -653,13 +656,23 @@ class TailshareApp(App[None]):
         """
         while True:
             self._transfer_manager.execute_queue()
-            self._update_queue_display()
             if not self._transfer_manager.get_pending_tasks():
                 break
         self._worker_running = False
+        self._queue_update_enabled = False
+    
+    def _on_transfer_progress(self, task: TransferTask) -> None:
+        """Update queue display when transfer progress changes.
+        
+        Args:
+            task: Task with updated progress
+        """
+        self.call_later(self._update_queue_display)
     
     def _update_queue_display(self) -> None:
         """Update the transfer queue display."""
+        if not self._queue_update_enabled:
+            return
         queue_widget = self.query_one("#transfer-queue", TransferQueue)
         tasks = self._transfer_manager.get_all_tasks()
         queue_widget.update_tasks(tasks)
