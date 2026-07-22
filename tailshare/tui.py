@@ -290,6 +290,7 @@ class TailshareApp(App[None]):
     #device-controls {
         margin: 0;
         height: auto;
+        align-horizontal: center;
     }
     
     #right-panel {
@@ -315,6 +316,10 @@ class TailshareApp(App[None]):
 
     #file-table {
         height: 1fr;
+    }
+    
+    #path-spacer {
+        height: 1;
     }
     
     #transfer-queue-container {
@@ -388,6 +393,8 @@ class TailshareApp(App[None]):
                 yield Label("[b]File Browser[/b]", id="file-header")
                 with ScrollableContainer(id="file-browser-container"):
                     yield FileBrowser(id="file-browser", path="/")
+                
+                yield Static(id="path-spacer")
                 
                 with Horizontal(id="transfer-controls"):
                     yield Input(
