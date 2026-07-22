@@ -173,11 +173,13 @@ class SFTPClient:
             # Only set key_filename if explicitly provided in config.
             key_paths = self._config.get_ssh_key_paths()
             if key_paths:
+                existing_keys = []
                 for key_path in key_paths:
                     expanded_path = expand_path(key_path)
                     if os.path.exists(expanded_path):
-                        auth_kwargs["key_filename"] = expanded_path
-                        break
+                        existing_keys.append(expanded_path)
+                if existing_keys:
+                    auth_kwargs["key_filename"] = existing_keys
             
             if password:
                 auth_kwargs["password"] = password
@@ -510,83 +512,83 @@ class TransferManager:
         """Execute all pending transfers in queue.
         
         Processes transfers sequentially, connecting to each device
-        as needed.
+        as needed. Loops until no pending tasks remain, so tasks
+        queued during execution are picked up automatically.
         """
-        pending = self.get_pending_tasks()
-        
-        if not pending:
-            return
-        
-        # Group tasks by device for efficiency
-        device_tasks: dict[str, list[TransferTask]] = {}
-        for task in pending:
-            device_key = task.device.ip
-            if device_key not in device_tasks:
-                device_tasks[device_key] = []
-            device_tasks[device_key].append(task)
-        
-        for device_ip, tasks in device_tasks.items():
-            # Find the device object
-            device = tasks[0].device
+        while True:
+            pending = self.get_pending_tasks()
             
-            self._logger.info(
-                f"Starting transfers to {device.name} ({len(tasks)} tasks)"
-            )
+            if not pending:
+                break
             
-            client = SFTPClient(device)
+            # Group tasks by device for efficiency
+            device_tasks: dict[str, list[TransferTask]] = {}
+            for task in pending:
+                device_key = task.device.ip
+                if device_key not in device_tasks:
+                    device_tasks[device_key] = []
+                device_tasks[device_key].append(task)
             
-            try:
-                # Connect using the first task's credentials for this device
-                first_task = tasks[0]
+            for device_ip, tasks in device_tasks.items():
+                # Find the device object
+                device = tasks[0].device
+                
+                self._logger.info(
+                    f"Starting transfers to {device.name} ({len(tasks)} tasks)"
+                )
+                
+                client = SFTPClient(device)
+                
                 try:
-                    client.connect(
-                        username=first_task.username, 
-                        password=first_task.password
-                    )
-                except TransferError as e:
-                    self._logger.error(f"Connection failed for {device.name}: {e}")
-                    for task in tasks:
-                        task.fail(f"Connection failed: {e}")
-                    continue
-                
-                for task in tasks:
+                    # Connect using the first task's credentials for this device
+                    first_task = tasks[0]
                     try:
-                        task.start()
-                        
-                        if os.path.isdir(task.source_path):
-                            client.transfer_folder(
-                                task.source_path,
-                                task.target_path,
-                                lambda p: self._update_progress(task, p),
-                            )
-                        else:
-                            client.transfer_file(
-                                task.source_path,
-                                task.target_path,
-                                lambda p: self._update_progress(task, p),
-                            )
-                        
-                        task.complete()
-                        self._logger.info(
-                            f"Transfer complete: {task.source_path}"
+                        client.connect(
+                            username=first_task.username, 
+                            password=first_task.password
                         )
-                        
                     except TransferError as e:
-                        task.fail(str(e))
-                        self._logger.error(
-                            f"Transfer failed: {task.source_path} - {e}"
-                        )
-                    except Exception as e:
-                        error_msg = f"Unexpected error ({type(e).__name__}): {e}"
-                        task.fail(error_msg)
-                        self._logger.error(
-                            f"Transfer error: {task.source_path} - {error_msg}"
-                        )
+                        self._logger.error(f"Connection failed for {device.name}: {e}")
+                        for task in tasks:
+                            task.fail(f"Connection failed: {e}")
+                        continue
+                    
+                    for task in tasks:
+                        try:
+                            task.start()
+                            
+                            if os.path.isdir(task.source_path):
+                                client.transfer_folder(
+                                    task.source_path,
+                                    task.target_path,
+                                    lambda p, t=task: self._update_progress(t, p),
+                                )
+                            else:
+                                client.transfer_file(
+                                    task.source_path,
+                                    task.target_path,
+                                    lambda p, t=task: self._update_progress(t, p),
+                                )
+                            
+                            task.complete()
+                            self._logger.info(
+                                f"Transfer complete: {task.source_path}"
+                            )
+                            
+                        except TransferError as e:
+                            task.fail(str(e))
+                            self._logger.error(
+                                f"Transfer failed: {task.source_path} - {e}"
+                            )
+                        except Exception as e:
+                            error_msg = f"Unexpected error ({type(e).__name__}): {e}"
+                            task.fail(error_msg)
+                            self._logger.error(
+                                f"Transfer error: {task.source_path} - {error_msg}"
+                            )
                 
-            finally:
-                client.disconnect()
-        
-        self._logger.info("All transfers completed")
+                finally:
+                    client.disconnect()
     
     def _update_progress(
         self,

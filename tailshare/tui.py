@@ -360,7 +360,7 @@ class TailshareApp(App[None]):
         self._selected_device: Device | None = None
         self._selected_device_name: str | None = None
         self._selected_path: str = ""
-        self._worker: Worker | None = None
+        self._worker_running = False
     
     def compose(self) -> ComposeResult:
         """Compose the UI layout."""
@@ -623,11 +623,13 @@ class TailshareApp(App[None]):
             
             self._update_queue_display()
             
-            # Start transfer worker
-            self._worker = self.run_worker(
-                self._execute_transfers,
-                thread=True,
-            )
+            # Start transfer worker if not already running
+            if not self._worker_running:
+                self._worker_running = True
+                self.run_worker(
+                    self._execute_transfers,
+                    thread=True,
+                )
             
         except TransferError as e:
             self.notify(
@@ -637,9 +639,17 @@ class TailshareApp(App[None]):
             )
     
     def _execute_transfers(self) -> None:
-        """Execute queued transfers in background."""
-        self._transfer_manager.execute_queue()
-        self._update_queue_display()
+        """Execute queued transfers in background.
+        
+        Loops until the queue is empty, picking up any tasks
+        queued during execution.
+        """
+        while True:
+            self._transfer_manager.execute_queue()
+            self._update_queue_display()
+            if not self._transfer_manager.get_pending_tasks():
+                break
+        self._worker_running = False
     
     def _update_queue_display(self) -> None:
         """Update the transfer queue display."""

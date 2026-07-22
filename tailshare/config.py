@@ -7,6 +7,7 @@ This module handles:
 - Utility functions
 """
 
+import copy
 import logging
 import os
 import pathlib
@@ -68,7 +69,7 @@ class Config:
     
     def _load_config(self) -> None:
         """Load configuration from file or use defaults."""
-        self._config = self.DEFAULT_CONFIG.copy()
+        self._config = copy.deepcopy(self.DEFAULT_CONFIG)
         
         if self._config_path.exists():
             try:
