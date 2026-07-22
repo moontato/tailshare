@@ -288,7 +288,7 @@ class TailshareApp(App[None]):
     }
 
     #device-controls {
-        margin: 1 0 0 0;
+        margin: 0;
         height: auto;
     }
     
