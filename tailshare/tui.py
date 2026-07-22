@@ -247,22 +247,29 @@ class TailshareApp(App[None]):
     }
     
     #main-container {
+        width: 100%;
         height: 1fr;
     }
     
     #left-panel {
-        width: 40%;
+        width: 1fr;
         height: 1fr;
         border: solid $primary;
         margin: 1;
     }
     
     #device-auth {
-        margin: 1 0;
+        margin: 0;
+        height: auto;
+    }
+
+    #device-controls {
+        margin: 1 0 0 0;
+        height: auto;
     }
     
     #right-panel {
-        width: 40%;
+        width: 1fr;
         height: 1fr;
         border: solid $primary;
         margin: 1;
@@ -272,8 +279,8 @@ class TailshareApp(App[None]):
         height: 1fr;
     }
     
-    #file-browser {
-        height: 1fr;
+    #file-browser-container {
+        height: 2fr;
     }
     
     #transfer-queue {
@@ -340,7 +347,8 @@ class TailshareApp(App[None]):
             
             with Vertical(id="right-panel"):
                 yield Label("[b]File Browser[/b]", id="file-header")
-                yield FileBrowser(id="file-browser", path="/")
+                with ScrollableContainer(id="file-browser-container"):
+                    yield FileBrowser(id="file-browser", path="/")
                 
                 with Horizontal(id="transfer-controls"):
                     yield Input(
@@ -357,6 +365,8 @@ class TailshareApp(App[None]):
     def on_mount(self) -> None:
         """Initialize app when mounted."""
         setup_logging()
+        device_list = self.query_one("#device-list", DataTable)
+        device_list.add_columns("Name", "IP", "Status")
         self._refresh_device_list()
     
     def on_key(self, event: events.Key) -> None:
@@ -444,8 +454,6 @@ class TailshareApp(App[None]):
         
         try:
             devices = self._device_discovery.discover()
-            
-            device_list.add_columns("Name", "IP", "Status")
             
             for device in devices:
                 status = "Online" if device.online else "Offline"
