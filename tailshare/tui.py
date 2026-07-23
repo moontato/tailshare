@@ -9,6 +9,7 @@ This module implements the terminal user interface with:
 
 import os
 import stat
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -375,7 +376,6 @@ class RemoteFileBrowser(Vertical):
                 self._refresh_entries()
             else:
                 # Select file - notify parent
-                self.app.notify(f"Selected remote file: {name}")
                 self.post_message(
                     RemoteFileSelected(self._path, str(Path(self._path) / name))
                 )
@@ -397,12 +397,12 @@ class TransferQueue(Static):
     
     def update_tasks(self, tasks: list[TransferTask]) -> None:
         """Update the displayed tasks.
-        
+
         Args:
             tasks: List of current transfer tasks
         """
         self._tasks = tasks
-        self.update(self.render())
+        self.refresh()
     
     def render(self) -> str:
         """Render the transfer queue."""
@@ -582,7 +582,9 @@ class TailshareApp(App[None]):
         self._selected_path: str = ""
         self._selected_remote_path: str = ""
         self._worker_running = False
+        self._worker_lock = threading.Lock()
         self._queue_update_enabled: bool = False
+        self._interval_token: Any = None
         self._remote_sftp_client: Any = None
     
     def compose(self) -> ComposeResult:
@@ -765,53 +767,70 @@ class TailshareApp(App[None]):
     
     def _refresh_device_list(self) -> None:
         """Refresh the list of Tailscale devices."""
+        self.run_worker(self._discover_and_populate, thread=True)
+
+    def _discover_and_populate(self) -> None:
+        """Discover devices in background and populate the list."""
         device_list = self.query_one("#device-list", DataTable)
         device_list.clear()
-        
+
         try:
             devices = self._device_discovery.discover()
-            
+
+            rows = []
             for device in devices:
                 status = "Online" if device.online else "Offline"
-                
-                # Apply highlight if this is the selected recipient
                 style_prefix = ""
                 style_suffix = ""
                 if self._selected_device_name == device.name:
                     style_prefix = "[background=$primary][color=$text][b]"
                     style_suffix = "[/]"
-                
-                device_list.add_row(
-                    f"{style_prefix}{device.name}{style_suffix}",
-                    f"{style_prefix}{device.ip}{style_suffix}",
-                    f"{style_prefix}{status}{style_suffix}",
-                    key=device.name,
+                rows.append(
+                    (
+                        f"{style_prefix}{device.name}{style_suffix}",
+                        f"{style_prefix}{device.ip}{style_suffix}",
+                        f"{style_prefix}{status}{style_suffix}",
+                        device.name,
+                    )
                 )
-            
+
             if not devices:
-                self.notify(
-                    "No Tailscale devices found",
-                    title="Warning",
-                    severity="warning",
+                self.call_later(
+                    lambda: self.notify(
+                        "No Tailscale devices found",
+                        title="Warning",
+                        severity="warning",
+                    )
                 )
-            
+
         except TailscaleNotRunningError as e:
-            self.notify(
-                str(e),
-                title="Tailscale Not Running",
-                severity="error",
+            self.call_later(
+                lambda: self.notify(
+                    str(e),
+                    title="Tailscale Not Running",
+                    severity="error",
+                )
             )
-            device_list.add_row(
-                "[Tailscale Not Running]",
-                "-",
-                "Error",
-            )
+            rows = [("[Tailscale Not Running]", "-", "Error", "error")]
         except Exception as e:
-            self.notify(
-                f"Device discovery failed: {e}",
-                title="Error",
-                severity="error",
+            self.call_later(
+                lambda: self.notify(
+                    f"Device discovery failed: {e}",
+                    title="Error",
+                    severity="error",
+                )
             )
+            rows = [("[Discovery Failed]", "-", "Error", "error")]
+
+        # Populate table on the main thread
+        self.call_later(lambda: self._populate_device_table(device_list, rows))
+
+    def _populate_device_table(
+        self, device_list: DataTable, rows: list[tuple]
+    ) -> None:
+        """Add rows to the device list table (must run on main thread)."""
+        for row in rows:
+            device_list.add_row(row[0], row[1], row[2], key=row[3])
     
     def _test_selected_device(self) -> None:
         """Test connection to selected device."""
@@ -893,24 +912,32 @@ class TailshareApp(App[None]):
             )
             
             self._update_queue_display()
-            
+
             # Start transfer worker if not already running
-            if not self._worker_running:
-                self._worker_running = True
-                self.run_worker(
-                    self._execute_transfers,
-                    thread=True,
-                )
-                self._queue_update_enabled = True
-                self.set_interval(0.5, self._update_queue_display)
-            
+            self._start_transfer_worker()
+
         except TransferError as e:
             self.notify(
                 str(e),
                 title="Transfer Error",
                 severity="error",
             )
-    
+
+    def _start_transfer_worker(self) -> None:
+        """Start the transfer worker if not already running."""
+        with self._worker_lock:
+            if self._worker_running:
+                return
+            self._worker_running = True
+            self.run_worker(
+                self._execute_transfers,
+                thread=True,
+            )
+            self._queue_update_enabled = True
+            self._interval_token = self.set_interval(
+                0.5, self._update_queue_display
+            )
+
     def _fetch_files(self) -> None:
         """Queue files for fetching."""
         if not self._selected_device:
@@ -920,7 +947,7 @@ class TailshareApp(App[None]):
                 severity="warning",
             )
             return
-        
+
         if not self._selected_remote_path:
             self.notify(
                 "Please select files to fetch",
@@ -928,40 +955,38 @@ class TailshareApp(App[None]):
                 severity="warning",
             )
             return
-        
+
         # Get credentials and local path
         user = self.query_one("#remote-user", Input).value.strip() or None
         password = self.query_one("#remote-password", Input).value.strip() or None
-        
+
         local_path_input = self.query_one("#local-path", Input)
         local_path = local_path_input.value.strip()
         if not local_path:
             local_path = "~"
-        
+
         # Queue the fetch
         try:
-            # Check if it's a directory by connecting and checking
+            # Check if it's a directory using the persistent connection
             is_folder = False
             try:
-                # Initialize persistent connection if needed
-                if not self._remote_sftp_client or self._remote_sftp_client._device != self._selected_device:
-                    self._remote_sftp_client = SFTPClient(self._selected_device)
-                    self._remote_sftp_client.connect(
-                        username=user,
-                        password=password,
+                if (
+                    self._remote_sftp_client
+                    and self._remote_sftp_client._sftp_client
+                ):
+                    remote_path = self._selected_remote_path
+                    if remote_path == "~":
+                        remote_path = "."
+                    elif remote_path.startswith("~"):
+                        remote_path = remote_path.replace("~", ".", 1)
+
+                    stat_result = self._remote_sftp_client._sftp_client.stat(
+                        remote_path
                     )
-                
-                remote_path = self._selected_remote_path
-                if remote_path == "~":
-                    remote_path = "."
-                elif remote_path.startswith("~"):
-                    remote_path = remote_path.replace("~", ".", 1)
-                
-                stat_result = self._remote_sftp_client._sftp_client.stat(remote_path)
-                is_folder = stat.S_ISDIR(stat_result.st_mode)
+                    is_folder = stat.S_ISDIR(stat_result.st_mode)
             except Exception:
                 pass
-            
+
             task = self._transfer_manager.queue_transfer(
                 self._selected_remote_path,
                 local_path,
@@ -971,24 +996,17 @@ class TailshareApp(App[None]):
                 password=password,
                 direction=TransferDirection.FETCH,
             )
-            
+
             self.notify(
                 f"Queued: {task.progress.filename}",
                 title="Fetch Queued",
             )
-            
+
             self._update_queue_display()
-            
+
             # Start transfer worker if not already running
-            if not self._worker_running:
-                self._worker_running = True
-                self.run_worker(
-                    self._execute_transfers,
-                    thread=True,
-                )
-                self._queue_update_enabled = True
-                self.set_interval(0.5, self._update_queue_display)
-            
+            self._start_transfer_worker()
+
         except TransferError as e:
             self.notify(
                 str(e),
@@ -1000,24 +1018,25 @@ class TailshareApp(App[None]):
         """Try to connect to selected device for remote browser."""
         if not self._selected_device:
             return
-        
+
         user = self.query_one("#remote-user", Input).value.strip() or None
         password = self.query_one("#remote-password", Input).value.strip() or None
-        
-        if user is None:
-            return
-        
+
         try:
             self._remote_sftp_client = SFTPClient(self._selected_device)
             self._remote_sftp_client.connect(username=user, password=password)
-            
+
             # Refresh remote browser with initial path
             remote_browser = self.query_one("#remote-file-browser", RemoteFileBrowser)
             remote_browser._refresh_entries()
-            
-        except TransferError:
-            # Connection failed, leave browser as "Not Connected"
+
+        except TransferError as e:
             self._remote_sftp_client = None
+            self.notify(
+                f"Cannot connect to {self._selected_device.name}: {e}",
+                title="Connection Failed",
+                severity="error",
+            )
     
     def _refresh_remote_browser(self) -> None:
         """Refresh the remote file browser."""
@@ -1026,16 +1045,26 @@ class TailshareApp(App[None]):
     
     def _execute_transfers(self) -> None:
         """Execute queued transfers in background.
-        
+
         Loops until the queue is empty, picking up any tasks
         queued during execution.
         """
-        while True:
-            self._transfer_manager.execute_queue()
-            if not self._transfer_manager.get_pending_tasks():
-                break
-        self._worker_running = False
-        self._queue_update_enabled = False
+        try:
+            while True:
+                self._transfer_manager.execute_queue()
+                if not self._transfer_manager.get_pending_tasks():
+                    break
+        finally:
+            self.call_later(self._on_worker_finished)
+
+    def _on_worker_finished(self) -> None:
+        """Clean up after the transfer worker finishes (runs on main thread)."""
+        with self._worker_lock:
+            self._worker_running = False
+            self._queue_update_enabled = False
+        if self._interval_token is not None:
+            self._interval_token.stop()
+            self._interval_token = None
     
     def _on_transfer_progress(self, task: TransferTask) -> None:
         """Update queue display when transfer progress changes.

@@ -41,10 +41,16 @@ class Config:
         },
     }
     
-    def __init__(self) -> None:
-        """Initialize configuration with defaults."""
+    def __init__(self, config_path: str | None = None) -> None:
+        """Initialize configuration with defaults.
+
+        Args:
+            config_path: Custom path to config file. If None, uses default.
+        """
         self._config: dict[str, Any] = {}
-        self._config_path: Path = self._get_config_path()
+        self._config_path: Path = (
+            Path(config_path) if config_path else self._get_config_path()
+        )
         self._load_config()
     
     def _get_config_path(self) -> Path:
@@ -192,15 +198,18 @@ class Config:
 _config: Config | None = None
 
 
-def get_config() -> Config:
+def get_config(config_path: str | None = None) -> Config:
     """Get the global configuration instance.
-    
+
+    Args:
+        config_path: Custom path to config file. Only used on first call.
+
     Returns:
         Global Config instance (creates if needed)
     """
     global _config
     if _config is None:
-        _config = Config()
+        _config = Config(config_path=config_path)
     return _config
 
 
@@ -231,29 +240,31 @@ def setup_logging() -> None:
 
 def validate_file_path(path: str, is_local: bool = True) -> str:
     """Validate a file path to prevent directory traversal attacks.
-    
+
     Args:
         path: File path to validate
-        is_local: Whether the path is on the local filesystem. 
-                 If False, os.path.abspath is not called.
-        
+        is_local: Whether the path is on the local filesystem.
+                  If False, os.path.abspath is not called.
+
     Returns:
         Normalized path
-        
+
     Raises:
         ValueError: If path contains directory traversal sequences
     """
+    # Check for directory traversal on the RAW path before normalization,
+    # because os.path.normpath resolves ".." and would hide the attack.
+    raw_parts = path.replace("\\", "/").split("/")
+    if ".." in raw_parts:
+        raise ValueError(f"Invalid path: directory traversal detected: {path}")
+
     # Normalize path
     normalized = os.path.normpath(path)
-    
-    # Check for directory traversal attempts
-    if ".." in normalized.split(os.sep):
-        raise ValueError(f"Invalid path: directory traversal detected: {path}")
-    
+
     # Convert to absolute path only if it's local
     if is_local and not os.path.isabs(normalized):
         normalized = os.path.abspath(normalized)
-    
+
     return normalized
 
 

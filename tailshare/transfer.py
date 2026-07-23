@@ -14,6 +14,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from enum import Enum
 from typing import Any, Callable
 
 import paramiko
@@ -69,7 +70,7 @@ class TransferProgress:
                 self.eta_seconds = remaining / self.speed_bps
 
 
-class TransferDirection:
+class TransferDirection(str, Enum):
     """Transfer direction constants."""
     SEND = "send"
     FETCH = "fetch"
@@ -103,7 +104,7 @@ class TransferTask:
     completed_at: float | None = None
     username: str | None = None
     password: str | None = None
-    direction: str = TransferDirection.SEND
+    direction: TransferDirection = TransferDirection.SEND
     
     def start(self) -> None:
         """Mark transfer as started."""
@@ -319,56 +320,94 @@ class SFTPClient:
         progress_callback: Callable[[TransferProgress], None] | None = None,
     ) -> None:
         """Transfer a folder recursively via SFTP.
-        
+
         Args:
             source_path: Local folder path
             target_path: Remote folder path
             progress_callback: Optional callback for progress updates
-            
+
         Raises:
             TransferError: If transfer fails
         """
         if not self._sftp_client:
             raise TransferError("Not connected. Call connect() first.")
-        
+
         # Validate source path
         source_path = validate_file_path(source_path)
-        
+
         if not os.path.exists(source_path):
             raise TransferError(f"Source folder not found: {source_path}")
-        
+
         if not os.path.isdir(source_path):
             raise TransferError(f"Source is not a folder: {source_path}")
-        
+
         self._logger.debug(
             f"Transferring folder {source_path} to {target_path}"
         )
-        
+
         # Create target directory
         self._ensure_remote_dir(target_path)
-        
-        # Walk through source folder
+
+        # Calculate total size for aggregate progress
+        total_size = 0
+        files_to_transfer: list[tuple[str, str]] = []
         for root, dirs, files in os.walk(source_path):
-            # Calculate relative path
             rel_path = os.path.relpath(root, source_path)
             if rel_path == ".":
                 remote_dir = target_path
             else:
                 remote_dir = os.path.join(target_path, rel_path)
-            
-            # Create remote directory
+
             self._ensure_remote_dir(remote_dir)
-            
-            # Transfer files
+
             for filename in files:
                 source_file = os.path.join(root, filename)
                 target_file = os.path.join(remote_dir, filename)
-                
-                self.transfer_file(
-                    source_file,
-                    target_file,
-                    progress_callback,
-                )
+                files_to_transfer.append((source_file, target_file))
+                total_size += os.path.getsize(source_file)
+
+        # Transfer files with aggregate progress
+        folder_progress = TransferProgress(
+            filename=os.path.basename(source_path),
+            total_size=total_size,
+        )
+        start_time = time.time()
+        transferred = 0
+
+        for source_file, target_file in files_to_transfer:
+            file_size = os.path.getsize(source_file)
+
+            def make_callback(
+                fp=folder_progress, st=start_time
+            ) -> Callable[[TransferProgress], None]:
+                def callback(file_progress: TransferProgress) -> None:
+                    nonlocal transferred
+                    # Update aggregate progress
+                    fp.transferred = transferred + file_progress.transferred
+                    if fp.total_size > 0:
+                        fp.percentage = (fp.transferred / fp.total_size) * 100
+                    fp.update_speed(time.time() - st)
+                    if progress_callback:
+                        progress_callback(fp)
+
+                    # Also report individual file progress
+                    if progress_callback:
+                        progress_callback(file_progress)
+                    return
+
+                return callback
+
+            self.transfer_file(
+                source_file,
+                target_file,
+                make_callback(),
+            )
+            transferred += file_size
+
+        # Final progress update
+        folder_progress.update(total_size, total_size)
+        if progress_callback:
+            progress_callback(folder_progress)
     
     def list_remote_dir(self, path: str) -> list[tuple[str, bool]]:
         """List contents of a remote directory.
@@ -605,7 +644,7 @@ class TransferManager:
         is_folder: bool = False,
         username: str | None = None,
         password: str | None = None,
-        direction: str = TransferDirection.SEND,
+        direction: TransferDirection = TransferDirection.SEND,
     ) -> TransferTask:
         """Queue a file/folder transfer.
         

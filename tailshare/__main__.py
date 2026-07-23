@@ -69,10 +69,14 @@ def main(args: list[str] | None = None) -> int:
         Exit code (0 for success, non-zero for errors)
     """
     parsed_args = parse_args(args)
-    
+
     # Set up logging
     setup_logging()
     logger = logging.getLogger(__name__)
+
+    # Initialize config with custom path if provided
+    if parsed_args.config:
+        get_config(config_path=parsed_args.config)
     
     if parsed_args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
