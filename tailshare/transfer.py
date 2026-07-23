@@ -69,6 +69,12 @@ class TransferProgress:
                 self.eta_seconds = remaining / self.speed_bps
 
 
+class TransferDirection:
+    """Transfer direction constants."""
+    SEND = "send"
+    FETCH = "fetch"
+
+
 @dataclass
 class TransferTask:
     """Represents a file transfer task.
@@ -84,6 +90,7 @@ class TransferTask:
         completed_at: Transfer completion time
         username: SSH username for authentication
         password: SSH password for authentication
+        direction: Transfer direction (send or fetch)
     """
     
     source_path: str
@@ -96,6 +103,7 @@ class TransferTask:
     completed_at: float | None = None
     username: str | None = None
     password: str | None = None
+    direction: str = TransferDirection.SEND
     
     def start(self) -> None:
         """Mark transfer as started."""
@@ -362,6 +370,175 @@ class SFTPClient:
                     progress_callback,
                 )
     
+    def list_remote_dir(self, path: str) -> list[tuple[str, bool]]:
+        """List contents of a remote directory.
+        
+        Args:
+            path: Remote directory path
+            
+        Returns:
+            List of (name, is_directory) tuples
+            
+        Raises:
+            TransferError: If directory cannot be listed
+        """
+        if not self._sftp_client:
+            raise TransferError("Not connected. Call connect() first.")
+        
+        # Handle ~ in remote path (SFTP doesn't support shell expansion)
+        if path == "~":
+            path = "."
+        elif path.startswith("~"):
+            path = path.replace("~", ".", 1)
+        
+        try:
+            entries = []
+            for attr in self._sftp_client.listdir_attr(path):
+                name = attr.filename
+                is_dir = stat.S_ISDIR(attr.st_mode)
+                entries.append((name, is_dir))
+            
+            return sorted(entries, key=lambda e: (not e[1], e[0]))
+            
+        except (IOError, OSError) as e:
+            raise TransferError(f"Cannot list directory {path}: {e}")
+    
+    def fetch_file(
+        self,
+        source_path: str,
+        target_path: str,
+        progress_callback: Callable[[TransferProgress], None] | None = None,
+    ) -> None:
+        """Fetch a single file via SFTP.
+        
+        Args:
+            source_path: Remote file path
+            target_path: Local file path
+            progress_callback: Optional callback for progress updates
+            
+        Raises:
+            TransferError: If fetch fails
+        """
+        if not self._sftp_client:
+            raise TransferError("Not connected. Call connect() first.")
+        
+        # Handle ~ in remote path
+        if source_path == "~":
+            source_path = "."
+        elif source_path.startswith("~"):
+            source_path = source_path.replace("~", ".", 1)
+        
+        # Ensure local target directory exists
+        target_dir = os.path.dirname(target_path)
+        if target_dir:
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except OSError as e:
+                raise TransferError(f"Cannot create local directory: {e}")
+        
+        # If target_path is a directory, append the filename to it
+        if os.path.isdir(target_path):
+            target_path = os.path.join(target_path, os.path.basename(source_path))
+            self._logger.info(f"Local target is directory, updating path to: {target_path}")
+        
+        # Get remote file info
+        try:
+            remote_stat = self._sftp_client.stat(source_path)
+
+        except (IOError, OSError) as e:
+            raise TransferError(f"Remote file not found: {source_path}: {e}")
+        
+        file_size = remote_stat.st_size
+        progress = TransferProgress(filename=os.path.basename(source_path))
+        
+        self._logger.debug(
+            f"Fetching {source_path} to {target_path} ({file_size} bytes)"
+        )
+        
+        start_time = time.time()
+        
+        self._logger.info(f"SFTP GET: {source_path} -> {target_path}")
+        
+        def progress_hook(transferred: int, total: int = None) -> None:
+            progress.update(transferred, file_size)
+            progress.update_speed(time.time() - start_time)
+            if progress_callback:
+                progress_callback(progress)
+        
+        self._sftp_client.get(
+            source_path,
+            target_path,
+            callback=progress_hook,
+        )
+        
+        progress.update(file_size, file_size)
+        if progress_callback:
+            progress_callback(progress)
+        
+        self._logger.debug(f"File fetch complete: {target_path}")
+    
+    def fetch_folder(
+        self,
+        source_path: str,
+        target_path: str,
+        progress_callback: Callable[[TransferProgress], None] | None = None,
+    ) -> None:
+        """Fetch a folder recursively via SFTP.
+        
+        Args:
+            source_path: Remote folder path
+            target_path: Local folder path
+            progress_callback: Optional callback for progress updates
+            
+        Raises:
+            TransferError: If fetch fails
+        """
+        if not self._sftp_client:
+            raise TransferError("Not connected. Call connect() first.")
+        
+        # Handle ~ in remote path
+        if source_path == "~":
+            source_path = "."
+        elif source_path.startswith("~"):
+            source_path = source_path.replace("~", ".", 1)
+        
+        self._logger.debug(
+            f"Fetching folder {source_path} to {target_path}"
+        )
+        
+        # Create local target directory
+        try:
+            os.makedirs(target_path, exist_ok=True)
+        except OSError as e:
+            raise TransferError(f"Cannot create local directory: {e}")
+        
+        # List remote directory
+        try:
+            entries = self.list_remote_dir(source_path)
+        except TransferError as e:
+            raise TransferError(f"Cannot browse remote directory: {e}")
+        
+        # Create local directory
+        os.makedirs(target_path, exist_ok=True)
+        
+        # Process entries
+        for name, is_dir in entries:
+            remote_entry = os.path.join(source_path, name)
+            local_entry = os.path.join(target_path, name)
+            
+            if is_dir:
+                self.fetch_folder(
+                    remote_entry,
+                    local_entry,
+                    progress_callback,
+                )
+            else:
+                self.fetch_file(
+                    remote_entry,
+                    local_entry,
+                    progress_callback,
+                )
+    
     def _ensure_remote_dir(self, path: str) -> None:
         """Ensure remote directory exists, creating if needed.
         
@@ -428,6 +605,7 @@ class TransferManager:
         is_folder: bool = False,
         username: str | None = None,
         password: str | None = None,
+        direction: str = TransferDirection.SEND,
     ) -> TransferTask:
         """Queue a file/folder transfer.
         
@@ -438,14 +616,20 @@ class TransferManager:
             is_folder: True if transferring a folder
             username: SSH username for authentication
             password: SSH password for authentication
+            direction: Transfer direction (send or fetch)
             
         Returns:
             Created transfer task
         """
-        source_path = validate_file_path(source_path)
-        
-        # Target path should not be expanded locally as it's for the remote system
-        target_path = target_path
+        if direction == TransferDirection.SEND:
+            source_path = validate_file_path(source_path, is_local=True)
+            # Target path should not be expanded locally as it's for the remote system
+            target_path = target_path
+        else:
+            # For fetch, source_path is remote, validate without abspath
+            source_path = validate_file_path(source_path, is_local=False)
+            # target_path is local and should be expanded and validated
+            target_path = validate_file_path(expand_path(target_path), is_local=True)
         
         progress = TransferProgress(
             filename=os.path.basename(source_path),
@@ -458,6 +642,7 @@ class TransferManager:
             progress=progress,
             username=username,
             password=password,
+            direction=direction,
         )
         
         with self._lock:
@@ -566,18 +751,45 @@ class TransferManager:
                         try:
                             task.start()
                             
-                            if os.path.isdir(task.source_path):
-                                client.transfer_folder(
-                                    task.source_path,
-                                    task.target_path,
-                                    lambda p, t=task: self._update_progress(t, p),
-                                )
+                            if task.direction == TransferDirection.FETCH:
+                                if task.source_path == "~":
+                                    remote_path = "."
+                                elif task.source_path.startswith("~"):
+                                    remote_path = task.source_path.replace("~", ".", 1)
+                                else:
+                                    remote_path = task.source_path
+                                
+                                try:
+                                    stat_result = client._sftp_client.stat(remote_path)
+                                    is_dir = stat.S_ISDIR(stat_result.st_mode)
+                                except (IOError, OSError):
+                                    is_dir = False
+                                
+                                if is_dir:
+                                    client.fetch_folder(
+                                        remote_path,
+                                        task.target_path,
+                                        lambda p, t=task: self._update_progress(t, p),
+                                    )
+                                else:
+                                    client.fetch_file(
+                                        remote_path,
+                                        task.target_path,
+                                        lambda p, t=task: self._update_progress(t, p),
+                                    )
                             else:
-                                client.transfer_file(
-                                    task.source_path,
-                                    task.target_path,
-                                    lambda p, t=task: self._update_progress(t, p),
-                                )
+                                if os.path.isdir(task.source_path):
+                                    client.transfer_folder(
+                                        task.source_path,
+                                        task.target_path,
+                                        lambda p, t=task: self._update_progress(t, p),
+                                    )
+                                else:
+                                    client.transfer_file(
+                                        task.source_path,
+                                        task.target_path,
+                                        lambda p, t=task: self._update_progress(t, p),
+                                    )
                             
                             task.complete()
                             self._logger.info(

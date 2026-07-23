@@ -229,14 +229,16 @@ def setup_logging() -> None:
     logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 
-def validate_file_path(path: str) -> str:
+def validate_file_path(path: str, is_local: bool = True) -> str:
     """Validate a file path to prevent directory traversal attacks.
     
     Args:
         path: File path to validate
+        is_local: Whether the path is on the local filesystem. 
+                 If False, os.path.abspath is not called.
         
     Returns:
-        Normalized absolute path
+        Normalized path
         
     Raises:
         ValueError: If path contains directory traversal sequences
@@ -248,8 +250,8 @@ def validate_file_path(path: str) -> str:
     if ".." in normalized.split(os.sep):
         raise ValueError(f"Invalid path: directory traversal detected: {path}")
     
-    # Convert to absolute path
-    if not os.path.isabs(normalized):
+    # Convert to absolute path only if it's local
+    if is_local and not os.path.isabs(normalized):
         normalized = os.path.abspath(normalized)
     
     return normalized
