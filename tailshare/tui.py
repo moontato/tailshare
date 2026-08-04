@@ -14,25 +14,21 @@ from pathlib import Path
 from typing import Any
 
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
+from textual.containers import Horizontal, Vertical, ScrollableContainer
 from textual.widgets import (
     Header,
     Footer,
     Label,
     Button,
-    Select,
     Static,
-    ProgressBar,
     DataTable,
     Input,
-    Checkbox,
     TabbedContent,
     TabPane,
 )
 from textual.binding import Binding
 from textual import events
 from textual.message import Message
-from textual.worker import Worker, WorkerState
 from textual.events import Resize
 
 class FileSelected(Message):
@@ -388,11 +384,11 @@ class RemoteFileBrowser(Vertical):
         self.focus()
 
 
-class TransferQueue(Static):
+class TransferQueue(Label):
     """Widget displaying transfer queue and progress."""
     
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__("", *args, **kwargs)
         self._tasks: list[TransferTask] = []
     
     def update_tasks(self, tasks: list[TransferTask]) -> None:
@@ -402,49 +398,44 @@ class TransferQueue(Static):
             tasks: List of current transfer tasks
         """
         self._tasks = tasks
-        self.refresh()
-    
-    def render(self) -> str:
-        """Render the transfer queue."""
         if not self._tasks:
-            return "[dim]No pending transfers[/dim]"
-        
-        lines = ["[b]Transfer Queue:[/b]"]
-        lines.append("")
-        
-        for i, task in enumerate(self._tasks, 1):
-            status_icon = {
-                "pending": "[yellow]⏳[/yellow]",
-                "transferring": "[blue]⏳[/blue]",
-                "completed": "[green]✓[/green]",
-                "failed": "[red]✗[/red]",
-            }.get(task.status, "?")
+            self.update("[dim]No pending transfers[/dim]")
+        else:
+            lines = ["[b]Transfer Queue:[/b]", ""]
             
-            lines.append(
-                f"{status_icon} [{i}] {task.progress.filename}"
-            )
-            if task.direction == TransferDirection.FETCH:
+            for i, task in enumerate(self._tasks, 1):
+                status_icon = {
+                    "pending": "[yellow]⏳[/yellow]",
+                    "transferring": "[blue]⏳[/blue]",
+                    "completed": "[green]✓[/green]",
+                    "failed": "[red]✗[/red]",
+                }.get(task.status, "?")
+                
                 lines.append(
-                    f"    ← {task.device.name}:{task.source_path}"
+                    f"{status_icon} [{i}] {task.progress.filename}"
                 )
-            else:
-                lines.append(
-                    f"    → {task.device.name}:{task.target_path}"
-                )
+                if task.direction == TransferDirection.FETCH:
+                    lines.append(
+                        f"    ← {task.device.name}:{task.source_path}"
+                    )
+                else:
+                    lines.append(
+                        f"    → {task.device.name}:{task.target_path}"
+                    )
+                
+                if task.status == "transferring":
+                    pct = task.progress.percentage
+                    lines.append(
+                        f"    [cyan]{pct:.1f}%[/cyan] "
+                        f"({task.progress.transferred / 1024:.1f} KB)"
+                    )
+                
+                if task.error:
+                    lines.append(f"    [red]{task.error}[/red]")
+                
+                lines.append("")
             
-            if task.status == "transferring":
-                pct = task.progress.percentage
-                lines.append(
-                    f"    [cyan]{pct:.1f}%[/cyan] "
-                    f"({task.progress.transferred / 1024:.1f} KB)"
-                )
-            
-            if task.error:
-                lines.append(f"    [red]{task.error}[/red]")
-            
-            lines.append("")
-        
-        return "\n".join(lines)
+            self.update("\n".join(lines))
 
 
 class TailshareApp(App[None]):

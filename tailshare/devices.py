@@ -10,7 +10,6 @@ This module handles:
 import json
 import logging
 import subprocess
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any

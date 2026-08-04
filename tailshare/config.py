@@ -10,7 +10,6 @@ This module handles:
 import copy
 import logging
 import os
-import pathlib
 import getpass
 from typing import Any
 from pathlib import Path
