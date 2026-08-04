@@ -67,4 +67,5 @@ dmypy.json
 .pytype/
 
 *.md
+!README.md
 image.png
