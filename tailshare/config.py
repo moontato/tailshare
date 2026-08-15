@@ -31,12 +31,6 @@ class Config:
             "timeout": 30,
             "port": 22,
         },
-        "ui": {
-            "refresh_interval": 5,  # seconds
-        },
-        "transfer": {
-            "show_hidden_files": False,
-        },
     }
 
     def __init__(self, config_path: str | None = None) -> None:
@@ -165,23 +159,6 @@ class Config:
             SSH port number (default: 22)
         """
         return self.get("ssh", "port", default=22)
-
-    def get_refresh_interval(self) -> int:
-        """Get UI refresh interval in seconds.
-
-        Returns:
-            Refresh interval in seconds (default: 5)
-        """
-        return self.get("ui", "refresh_interval", default=5)
-
-    def should_show_hidden_files(self) -> bool:
-        """Check if hidden files should be shown in file browser.
-
-        Returns:
-            True if hidden files should be shown
-        """
-        return self.get("transfer", "show_hidden_files", default=False)
-
 
 # Global config instance
 _config: Config | None = None

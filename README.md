@@ -1,75 +1,79 @@
 # Tailshare
 
-A terminal-based file-sharing utility for Tailscale networks. Simplifies file transfers between your Linux devices over Tailscale with an interactive TUI interface.
+A terminal-based file-sharing utility for Tailscale networks. Send and fetch files between your Linux devices over Tailscale with an interactive TUI.
+
+![Tailshare screenshot](image.png)
 
 ## Features
 
-- **Auto-discovery**: Automatically discovers devices on your Tailscale network
-- **TUI Interface**: Modern terminal UI with file browser, device list, and transfer queue
-- **SFTP Transfers**: Secure file transfers using SSH/SFTP over Tailscale
+- **Auto-discovery**: Automatically discovers devices on your Tailscale network (`tailscale status`, no API keys)
+- **Bidirectional transfers**: Push files *to* a device (Send) or pull files *from* it (Fetch) via SFTP
+- **TUI Interface**: Terminal UI with local and remote file browsers, device list, and per-tab transfer queues
 - **Folder Support**: Recursively transfer folders with directory structure preserved
 - **Progress Tracking**: Real-time transfer progress with speed and ETA
-- **Multi-transfer**: Queue multiple transfers and let them run
-- **No API Keys**: Uses `tailscale status` CLI command (no authentication required)
+- **Multi-transfer**: Queue multiple transfers; tasks queued mid-run are picked up automatically
+- **Per-tab status chips**: Each tab shows a live summary of its transfers (active / done / failed)
 
 ## Requirements
 
 - Python 3.10 or higher
-- Tailscale installed and running on source device
+- Linux (Ubuntu, Mint, Arch, etc.)
+- Tailscale installed and running on the device you run tailshare from
 - SSH server running on target devices
-- SSH key authentication configured (passwordless SSH)
+- SSH authentication to target devices — either SSH keys (passwordless) or a password entered in the TUI
 
 ## Installation
 
-### Quick Install (Development)
-
 ```bash
-# Clone the repository
-git clone https://github.com/tailshare/tailshare.git
-cd tailshare
+# From the repository root
+pip install .
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the application
+# Run it
+tailshare
+# or
 python -m tailshare
 ```
 
-### Install as Package
+`requirements.txt` at the repository root lists the same dependencies plus the testing tools.
+
+### CLI options
 
 ```bash
-# Install in editable mode for development
-pip install -e .
-
-# Or install normally
-pip install .
-
-# Run the command
-tailshare
+tailshare                        # normal start
+tailshare --config PATH          # use a custom config file
+tailshare --log-level DEBUG      # set log level (DEBUG/INFO/WARNING/ERROR)
+tailshare --verbose              # DEBUG for tailshare and libraries
+tailshare --version
 ```
-
-### System Requirements
-
-- Linux distribution (Ubuntu, Mint, Arch, etc.)
-- Tailscale CLI installed (`tailscale` command in PATH)
-- SSH client installed (`ssh` command in PATH)
 
 ## Usage
 
-### Starting the Application
+### Selecting a device
 
-```bash
-python -m tailshare
-# or if installed as package:
-tailshare
-```
+1. Start tailshare; the device list fills in from `tailscale status`.
+2. Select a device in the left panel. The table uses a cell cursor: **click a row, then click it again (or press Enter)** to select it.
+3. Optionally enter the remote **username** and **password** in the inputs below the device list. Leave both empty to use your local username and SSH key/agent authentication.
+4. Press **Refresh** to rediscover devices and (re)connect the remote browser, or **Test** to check SSH connectivity to the selected device.
 
-### TUI Controls
+### Sending files (Send tab)
+
+1. Navigate to the file or folder in the local file browser (`j`/`k`, `Enter`, `r` to refresh).
+2. Enter the remote destination path (default `~` = the remote home directory). `~`-relative and relative paths are allowed; `..` traversal is rejected.
+3. Click **Send** (or press `s`) to queue the transfer.
+
+### Fetching files (Fetch tab)
+
+1. Pick a device first — the remote file browser connects automatically and lists the remote home directory (click `..` to go up, `r` to refresh).
+2. Select a file or directory in the remote browser.
+3. Enter the local destination path (default `~`).
+4. Click **Fetch** (or press `f`) to queue the download.
+
+### TUI controls
 
 | Key | Action |
 |-----|--------|
-| `j/k` | Navigate file browser |
-| `Enter` | Select file/enter directory |
+| `j` / `k` | Navigate file browser |
+| `Enter` | Select file / enter directory |
 | `r` | Refresh current view |
 | `R` | Refresh remote file browser (Fetch tab) |
 | `d` | Refresh device list |
@@ -78,15 +82,6 @@ tailshare
 | `c` | Clear completed transfers |
 | `q` | Quit application |
 
-### Workflow
-
-1. **Discover Devices**: The app automatically discovers Tailscale devices on startup
-2. **Select Target**: Click on a device in the device list (left panel)
-3. **Browse Files**: Navigate to files/folders in the file browser (right panel)
-4. **Set Remote Path**: Enter the destination path (defaults to `~` for home directory)
-5. **Send**: Click "Send" to queue the transfer
-6. **Monitor**: Watch transfer progress in the queue display
-
 ### Configuration
 
 Create `~/.config/tailshare/config.yaml` to customize settings:
@@ -94,33 +89,30 @@ Create `~/.config/tailshare/config.yaml` to customize settings:
 ```yaml
 ssh:
   key_paths:
-    - ~/.ssh/id_ed25519  # Custom SSH key path (optional, uses defaults if empty)
+    - ~/.ssh/id_ed25519   # Custom SSH key paths (optional; default keys if empty)
+  user: null              # Remote SSH username (null = local username)
   timeout: 30             # Connection timeout in seconds
   port: 22                # SSH port
-ui:
-  refresh_interval: 5     # Device list refresh interval in seconds
-transfer:
-  show_hidden_files: false  # Show hidden files in browser
 ```
+
+Values are deep-merged over the defaults, so a partial file is fine.
 
 ### Logging
 
-All transfer activities are logged to `~/.tailscale_share/log.txt`.
+All activity is logged to `~/.tailscale_share/log.txt` (INFO by default).
 
 ## SSH Setup
 
-For passwordless transfers, set up SSH key authentication on target devices:
+Passwordless key authentication is the smoothest option on target devices:
 
 ```bash
-# On source device, generate SSH key if you don't have one
+# On the device you run tailshare from
 ssh-keygen -t ed25519 -C "tailshare"
-
-# Copy public key to target device
 ssh-copy-id user@target-device
-
-# Test connection
-ssh user@target-device
+ssh user@target-device   # verify
 ```
+
+If you can't set up keys, just enter the target's username and password in the TUI — the password is held in memory for the duration of the session, never written to disk.
 
 ## Troubleshooting
 
@@ -131,6 +123,7 @@ Error: Tailscale is not running. Run: sudo tailscale up
 ```
 
 Start Tailscale:
+
 ```bash
 sudo tailscale up
 ```
@@ -138,9 +131,9 @@ sudo tailscale up
 ### SSH Connection Failed
 
 Ensure:
-1. SSH server is running on target: `sudo systemctl status ssh`
-2. SSH keys are set up for passwordless authentication
-3. Target device is online in Tailscale
+1. SSH server is running on the target: `sudo systemctl status ssh`
+2. The username/password (or SSH keys) are correct
+3. The target device is online in Tailscale
 
 ### No Devices Found
 
@@ -150,67 +143,61 @@ Ensure:
 
 ## Testing
 
-### Run Unit Tests
+The test suite is hermetic (no Tailscale or SSH servers required):
 
 ```bash
 pytest tests/ -v
-```
-
-### Run with Coverage
-
-```bash
 pytest tests/ --cov=tailshare --cov-report=html
 ```
 
-### Integration Testing
-
-Integration tests require actual Tailscale devices. To manually test:
-
-1. Set up two devices on the same Tailscale network
-2. Configure SSH key authentication between them
-3. Run tailshare on the source device
-4. Transfer files and verify on target device
+For a real end-to-end check, set up two devices on the same tailnet, run tailshare on one, and send a file in both directions.
 
 ## Project Structure
 
 ```
-tailshare/
-├── __init__.py          # Package initialization
-├── __main__.py          # Entry point
-├── config.py            # Configuration and logging
-├── devices.py           # Tailscale device discovery
-├── transfer.py          # SFTP transfer logic
-├── tui.py               # Textual TUI interface
-├── pyproject.toml       # Package configuration
-└── requirements.txt     # Dependencies
-
-tests/
-├── __init__.py
-├── test_devices.py      # Device discovery tests
-└── test_transfer.py     # Transfer logic tests
+.
+├── pyproject.toml           # Package configuration
+├── requirements.txt         # Dependencies (runtime + testing)
+├── LICENSE                  # MIT License
+├── image.png                # Screenshot
+├── tailshare/
+│   ├── __init__.py          # Package initialization
+│   ├── __main__.py          # CLI entry point
+│   ├── config.py            # Configuration, logging, path validation
+│   ├── devices.py           # Tailscale device discovery
+│   ├── transfer.py          # SFTP transfers and queue management
+│   └── tui.py               # Textual TUI
+└── tests/
+    ├── test_config.py       # Configuration and logging tests
+    ├── test_devices.py      # Device discovery tests
+    ├── test_main.py         # CLI entry point tests
+    ├── test_sftp_client.py  # SFTP client + queue manager (fake SFTP)
+    ├── test_tui_connect.py  # TUI device selection and connect lifecycle
+    ├── test_tui_smoke.py    # TUI smoke tests
+    ├── test_transfer.py     # Progress/task/manager tests
+    └── test_transfer_validation.py  # Path validation across directions
 ```
 
 ## Planned Features
 
-These features are documented for future development but are **not implemented** in v1:
+Documented for future development, **not implemented**:
 
 - **Resume Interrupted Transfers**: Checkpoint-based transfer resumption
 - **End-to-End Encryption**: Additional encryption beyond Tailscale's encryption
 - **Automatic Sync**: File/folder watching for automatic synchronization
-- **Pull-based Transfers**: Target device can request files from source
 - **Transfer Scheduling**: Queue transfers for specific times
 - **Bandwidth Limiting**: Control transfer speed to avoid network saturation
 
 ## Security
 
-- SSH key authentication only (no password storage)
-- All file paths validated to prevent directory traversal
-- Transfer activity logged for audit purposes
-- Tailscale network encryption for all transfers
+- **Authentication**: SSH key or password. Passwords are held in memory only — they are never written to disk, logs, or object reprs.
+- **Path validation**: All local and remote paths are validated before use; directory-traversal sequences (`..`) are rejected on the raw input before any expansion or normalization, in both transfer directions.
+- **Host key verification**: `paramiko.AutoAddPolicy()` is used, so remote host keys are **not** verified. This is an accepted trade-off on a WireGuard-encrypted tailnet where all traffic is already authenticated and encrypted end-to-end; if you need host key pinning, extend `SFTPClient.connect()`.
+- **Auditing**: Transfer activity is logged to `~/.tailscale_share/log.txt`.
 
 ## License
 
-MIT License - see LICENSE file for details.
+MIT License — see the [LICENSE](LICENSE) file.
 
 ## Contributing
 

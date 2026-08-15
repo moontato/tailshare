@@ -23,8 +23,9 @@ class TestConfig:
         assert config.get_ssh_port() == 22
         assert config.get_ssh_timeout() == 30
         assert config.get_ssh_key_paths() == []
-        assert config.get_refresh_interval() == 5
-        assert config.should_show_hidden_files() is False
+        # only the ssh section exists; phantom sections must not appear
+        assert config.get("ui") is None
+        assert config.get("transfer") is None
 
     def test_file_overrides_defaults_with_deep_merge(self, tmp_path) -> None:
         path = tmp_path / "config.yaml"
@@ -34,7 +35,7 @@ class TestConfig:
         assert config.get_ssh_port() == 2222
         # untouched keys keep their defaults (recursive merge, not replace)
         assert config.get_ssh_timeout() == 30
-        assert config.get_refresh_interval() == 5
+        assert config.get_ssh_key_paths() == []
 
     def test_invalid_yaml_falls_back_to_defaults(self, tmp_path) -> None:
         path = tmp_path / "config.yaml"
