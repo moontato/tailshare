@@ -382,3 +382,110 @@ class TestDeviceDiscoveryIntegration:
 
             with pytest.raises(DeviceDiscoveryError):
                 discovery.discover()
+
+
+class TestRealTailscaleSchema:
+    """Tests against the real `tailscale status --json` output shape.
+
+    Real Tailscale emits a `Peer` dict keyed by IP, with `DNSName`,
+    `TailscaleIPs`, `MachineID` fields (no `Name`/`HostName`/`PrimaryIPs`).
+    Regression for B2: the old parser produced name='unknown' for every
+    peer, which crashed the TUI with DuplicateKey on 2+ devices.
+    """
+
+    @pytest.fixture
+    def discovery(self) -> DeviceDiscovery:
+        return DeviceDiscovery()
+
+    def test_parse_status_real_schema(self, discovery: DeviceDiscovery) -> None:
+        status_data = {
+            "BackendState": "Running",
+            "Self": {
+                "DnsName": "thishost.tailnet.ts.net",
+                "IP": "100.64.0.10",
+                "MachineID": "m-self",
+            },
+            "Peer": {
+                "100.64.0.20": {
+                    "DNSName": "dest-pc.tailnet.ts.net",
+                    "TailscaleIPs": ["100.64.0.20"],
+                    "Online": True,
+                    "LastSeen": "2m ago",
+                    "OS": "linux",
+                    "MachineID": "m-dest",
+                },
+                "100.64.0.30": {
+                    "DNSName": "server.tailnet.ts.net",
+                    "TailscaleIPs": ["100.64.0.30"],
+                    "Online": False,
+                    "LastSeen": "3h ago",
+                    "OS": "windows",
+                    "MachineID": "m-server",
+                },
+            },
+        }
+
+        devices = discovery._parse_status(status_data)
+
+        assert [d.name for d in devices] == ["dest-pc", "server"]
+        assert devices[0].hostname == "dest-pc.tailnet.ts.net"
+        assert devices[0].ip == "100.64.0.20"
+        assert devices[0].online is True
+        assert devices[0].last_seen == "2m ago"
+        assert devices[0].machine_id == "m-dest"
+        assert devices[1].name == "server"
+        assert devices[1].online is False
+        assert devices[1].machine_id == "m-server"
+
+    def test_parse_status_real_schema_excludes_self(
+        self, discovery: DeviceDiscovery
+    ) -> None:
+        status_data = {
+            "Self": {"DnsName": "thishost.tailnet.ts.net", "IP": "100.64.0.10"},
+            "Peer": {
+                "100.64.0.10": {
+                    "DNSName": "thishost.tailnet.ts.net",
+                    "TailscaleIPs": ["100.64.0.10"],
+                    "Online": True,
+                    "MachineID": "m-self",
+                },
+                "100.64.0.20": {
+                    "DNSName": "dest-pc.tailnet.ts.net",
+                    "TailscaleIPs": ["100.64.0.20"],
+                    "Online": True,
+                    "MachineID": "m-dest",
+                },
+            },
+        }
+
+        devices = discovery._parse_status(status_data)
+
+        assert [d.name for d in devices] == ["dest-pc"]
+
+    def test_duplicate_names_keep_unique_row_keys(
+        self, discovery: DeviceDiscovery
+    ) -> None:
+        """Two peers with the same name must still yield distinct row keys
+        (machine id or IP) so the TUI table cannot hit DuplicateKey."""
+        status_data = {
+            "Self": {"IP": "100.64.0.10"},
+            "Peer": {
+                "100.64.0.20": {
+                    "DNSName": "box.tailnet.ts.net",
+                    "TailscaleIPs": ["100.64.0.20"],
+                    "Online": True,
+                    "MachineID": "m-a",
+                },
+                "100.64.0.30": {
+                    "DNSName": "box.tailnet.ts.net",
+                    "TailscaleIPs": ["100.64.0.30"],
+                    "Online": True,
+                    "MachineID": "m-b",
+                },
+            },
+        }
+
+        devices = discovery._parse_status(status_data)
+
+        assert len(devices) == 2
+        assert {d.machine_id or d.ip for d in devices} == {"m-a", "m-b"}

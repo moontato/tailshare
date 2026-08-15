@@ -71,13 +71,13 @@ def main(args: list[str] | None = None) -> int:
     """
     parsed_args = parse_args(args)
 
+    # Initialize config first (honoring --config): setup_logging() also
+    # initializes the config singleton, so it must run after this.
+    get_config(config_path=parsed_args.config)
+
     # Set up logging
     setup_logging()
     logger = logging.getLogger(__name__)
-
-    # Initialize config with custom path if provided
-    if parsed_args.config:
-        get_config(config_path=parsed_args.config)
 
     if parsed_args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
