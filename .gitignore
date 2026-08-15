@@ -38,10 +38,6 @@ htmlcov/
 # Log files
 *.log
 logs/
-~/.tailscale_share/
-
-# Configuration
-~/.config/tailshare/
 
 # Jupyter Notebook
 .ipynb_checkpoints

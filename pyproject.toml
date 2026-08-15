@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,8 @@ name = "tailshare"
 version = "1.0.0"
 description = "A file-sharing utility for Tailscale networks with TUI interface"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
     {name = "Tailshare Contributors"}
@@ -58,3 +59,23 @@ asyncio_mode = "auto"
 [tool.coverage.run]
 source = ["tailshare"]
 omit = ["tests/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "PLW",  # pylint warnings
+    "RUF",  # ruff-specific rules
+]
+ignore = [
+    "RUF012",  # mutable class-level defaults: Textual BINDINGS idiom
+]
