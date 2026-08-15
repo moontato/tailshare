@@ -225,6 +225,11 @@ class SFTPClient:
         except OSError as e:
             raise TransferError(f"Connection error: {e}") from e
 
+    @property
+    def device(self) -> Device:
+        """The device this client targets."""
+        return self._device
+
     def disconnect(self) -> None:
         """Close SSH/SFTP connections."""
         if self._sftp_client:
@@ -233,6 +238,31 @@ class SFTPClient:
         if self._ssh_client:
             self._ssh_client.close()
             self._ssh_client = None
+
+    def is_remote_dir(self, path: str) -> bool | None:
+        """Check whether a remote path is a directory.
+
+        Args:
+            path: Remote path to check ('~' expands to the home directory)
+
+        Returns:
+            True if the path is a directory, False if it is a file,
+            None if not connected or the path does not exist
+        """
+        if not self._sftp_client:
+            return None
+
+        if path == "~":
+            path = "."
+        elif path.startswith("~"):
+            path = path.replace("~", ".", 1)
+
+        try:
+            stat_result = self._sftp_client.stat(path)
+        except OSError:
+            return None
+
+        return stat.S_ISDIR(stat_result.st_mode)
 
     def transfer_file(
         self,
@@ -798,11 +828,7 @@ class TransferManager:
                                 else:
                                     remote_path = task.source_path
 
-                                try:
-                                    stat_result = client._sftp_client.stat(remote_path)
-                                    is_dir = stat.S_ISDIR(stat_result.st_mode)
-                                except OSError:
-                                    is_dir = False
+                                is_dir = client.is_remote_dir(remote_path) is True
 
                                 if is_dir:
                                     client.fetch_folder(

@@ -7,9 +7,10 @@ This module implements the terminal user interface with:
 - Status messages
 """
 
+import contextlib
 import os
-import stat
 import threading
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -243,6 +244,7 @@ class RemoteFileBrowser(Vertical):
         self._entries: list[tuple[str, bool]] = []  # (name, is_directory)
         self._name_column_key: Any = None
         self._app = app
+        self._refresh_generation = 0
 
     @property
     def path(self) -> str:
@@ -275,31 +277,60 @@ class RemoteFileBrowser(Vertical):
                 table.refresh()
 
     def _refresh_entries(self) -> None:
-        """Refresh the remote file/directory listing."""
+        """Refresh the remote listing without blocking the UI thread."""
+        # Get SFTP client - either from direct reference or app
+        sftp_client = self._sftp_client
+        if sftp_client is None and self._app is not None:
+            sftp_client = getattr(self._app, "_remote_sftp_client", None)
+
+        if sftp_client is None:
+            self._entries = [("<Not Connected>", False)]
+            self._update_table()
+            return
+
+        path = self._path
+
+        # Guard against stale results when refreshes overlap
+        self._refresh_generation += 1
+        generation = self._refresh_generation
+
+        def on_listed(entries: list[tuple[str, bool]]) -> None:
+            if generation == self._refresh_generation:
+                self._show_entries(path, entries)
+
+        def on_error(message: str) -> None:
+            if generation == self._refresh_generation:
+                self._show_entries(path, [(message, False)])
+
+        self.run_worker(
+            partial(self._list_remote_dir, sftp_client, path, on_listed, on_error),
+            thread=True,
+        )
+
+    def _list_remote_dir(
+        self,
+        sftp_client: Any,
+        path: str,
+        on_listed: Any,
+        on_error: Any,
+    ) -> None:
+        """List a remote directory in a background thread."""
+        try:
+            entries = sftp_client.list_remote_dir(path)
+        except TransferError as e:
+            self.call_later(on_error, str(e))
+            return
+        self.call_later(on_listed, entries)
+
+    def _show_entries(self, path: str, entries: list[tuple[str, bool]]) -> None:
+        """Apply a directory listing to the table (main thread)."""
         self._entries = []
 
-        try:
-            path = self._path
+        if path != "~" and path != ".":
+            # Add parent directory entry
+            self._entries.append(("..", True))
 
-            if path != "~" and path != ".":
-                # Add parent directory entry
-                self._entries.append(("..", True))
-
-            # Get SFTP client - either from direct reference or app
-            sftp_client = self._sftp_client
-            if sftp_client is None and self._app is not None:
-                sftp_client = getattr(self._app, "_remote_sftp_client", None)
-
-            # Get directory contents via SFTP
-            if sftp_client is not None:
-                entries = sftp_client.list_remote_dir(path)
-                self._entries.extend(entries)
-            else:
-                self._entries = [("<Not Connected>", True)]
-
-        except Exception:
-            self._entries = [("<Permission Denied>", True)]
-
+        self._entries.extend(entries)
         self._update_table()
 
     def _update_table(self) -> None:
@@ -628,6 +659,12 @@ class TailshareApp(App[None]):
         device_list.add_columns("Name", "IP", "Status")
         self._refresh_device_list()
 
+    def on_unmount(self) -> None:
+        """Release the persistent SFTP client when the app exits."""
+        if self._remote_sftp_client is not None:
+            self._remote_sftp_client.disconnect()
+            self._remote_sftp_client = None
+
     def on_key(self, event: events.Key) -> None:
         """Handle key events."""
         if event.key == "escape":
@@ -746,12 +783,15 @@ class TailshareApp(App[None]):
 
     def _refresh_device_list(self) -> None:
         """Refresh the list of Tailscale devices."""
-        self.run_worker(self._discover_and_populate, thread=True)
+        self.run_worker(self._discover_devices, thread=True)
 
-    def _discover_and_populate(self) -> None:
-        """Discover devices in background and populate the list."""
-        device_list = self.query_one("#device-list", DataTable)
-        device_list.clear()
+    def _discover_devices(self) -> None:
+        """Discover devices in a background thread.
+
+        Performs no DOM access; the table update is scheduled on the
+        main thread via call_later.
+        """
+        rows: list[tuple] = []
 
         try:
             devices = self._device_discovery.discover()
@@ -809,40 +849,46 @@ class TailshareApp(App[None]):
             rows = [("[Discovery Failed]", "-", "Error", "error")]
 
         # Populate table on the main thread
-        self.call_later(lambda: self._populate_device_table(device_list, rows))
+        self.call_later(self._populate_device_table, rows)
 
-    def _populate_device_table(
-        self, device_list: DataTable, rows: list[tuple]
-    ) -> None:
-        """Add rows to the device list table (must run on main thread)."""
+    def _populate_device_table(self, rows: list[tuple]) -> None:
+        """Clear and populate the device list (must run on main thread)."""
+        device_list = self.query_one("#device-list", DataTable)
+        device_list.clear()
         for row in rows:
             device_list.add_row(row[0], row[1], row[2], key=row[3])
 
     def _test_selected_device(self) -> None:
-        """Test connection to selected device."""
+        """Test connection to the selected device (off the UI thread)."""
         if not self._selected_device:
             self.notify("No device selected", title="Warning", severity="warning")
             return
 
+        device = self._selected_device
         user = self.query_one("#remote-user", Input).value.strip() or None
         password = self.query_one("#remote-password", Input).value.strip() or None
 
+        self.run_worker(
+            partial(self._test_connection_in_thread, device, user, password),
+            thread=True,
+        )
+
+    def _test_connection_in_thread(
+        self, device: Device, user: str | None, password: str | None
+    ) -> None:
+        """Run a blocking connection test in a background thread."""
         success, message = self._transfer_manager.test_device_connection(
-            self._selected_device,
+            device,
             username=user,
             password=password,
         )
-
         if success:
-            self.notify(
-                f"Connection to {self._selected_device.name} successful",
-                title="Connection Test",
-            )
+            msg = f"Connection to {device.name} successful"
+            self.call_later(lambda: self.notify(msg, title="Connection Test"))
         else:
-            self.notify(
-                f"Connection failed: {message}",
-                title="Connection Test",
-                severity="error",
+            msg = f"Connection failed: {message}"
+            self.call_later(
+                lambda: self.notify(msg, title="Connection Test", severity="error")
             )
 
     def _send_files(self) -> None:
@@ -955,23 +1001,14 @@ class TailshareApp(App[None]):
         try:
             # Check if it's a directory using the persistent connection
             is_folder = False
-            try:
-                if (
-                    self._remote_sftp_client
-                    and self._remote_sftp_client._sftp_client
-                ):
-                    remote_path = self._selected_remote_path
-                    if remote_path == "~":
-                        remote_path = "."
-                    elif remote_path.startswith("~"):
-                        remote_path = remote_path.replace("~", ".", 1)
-
-                    stat_result = self._remote_sftp_client._sftp_client.stat(
-                        remote_path
+            if self._remote_sftp_client is not None:
+                with contextlib.suppress(Exception):
+                    is_folder = (
+                        self._remote_sftp_client.is_remote_dir(
+                            self._selected_remote_path
+                        )
+                        is True
                     )
-                    is_folder = stat.S_ISDIR(stat_result.st_mode)
-            except Exception:
-                pass
 
             task = self._transfer_manager.queue_transfer(
                 self._selected_remote_path,
@@ -1001,28 +1038,57 @@ class TailshareApp(App[None]):
             )
 
     def _connect_for_remote_browser(self) -> None:
-        """Try to connect to selected device for remote browser."""
+        """Start connecting to the selected device for the remote browser."""
         if not self._selected_device:
             return
 
+        device = self._selected_device
         user = self.query_one("#remote-user", Input).value.strip() or None
         password = self.query_one("#remote-password", Input).value.strip() or None
 
+        # The SSH connection is blocking; run it off the UI thread.
+        self.run_worker(
+            partial(self._connect_in_thread, device, user, password),
+            thread=True,
+        )
+
+    def _connect_in_thread(
+        self, device: Device, user: str | None, password: str | None
+    ) -> None:
+        """Connect in a background thread and hand the client back."""
+        client = SFTPClient(device)
         try:
-            self._remote_sftp_client = SFTPClient(self._selected_device)
-            self._remote_sftp_client.connect(username=user, password=password)
-
-            # Refresh remote browser with initial path
-            remote_browser = self.query_one("#remote-file-browser", RemoteFileBrowser)
-            remote_browser._refresh_entries()
-
+            client.connect(username=user, password=password)
         except TransferError as e:
-            self._remote_sftp_client = None
-            self.notify(
-                f"Cannot connect to {self._selected_device.name}: {e}",
-                title="Connection Failed",
-                severity="error",
+            msg = f"Cannot connect to {device.name}: {e}"
+            self.call_later(
+                lambda: self.notify(
+                    msg, title="Connection Failed", severity="error"
+                )
             )
+            return
+        self.call_later(self._adopt_remote_client, client)
+
+    def _adopt_remote_client(self, client: SFTPClient) -> None:
+        """Install a connected client, releasing the previous one (main thread)."""
+        if (
+            self._selected_device is None
+            or client.device.ip != self._selected_device.ip
+        ):
+            # The selection changed while the connection was in flight.
+            client.disconnect()
+            return
+
+        if (
+            self._remote_sftp_client is not None
+            and self._remote_sftp_client is not client
+        ):
+            self._remote_sftp_client.disconnect()
+
+        self._remote_sftp_client = client
+        remote_browser = self.query_one("#remote-file-browser", RemoteFileBrowser)
+        remote_browser._sftp_client = client
+        remote_browser._refresh_entries()
 
     def _execute_transfers(self) -> None:
         """Execute queued transfers in background.
