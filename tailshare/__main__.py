@@ -81,7 +81,7 @@ def main(args: list[str] | None = None) -> int:
     if parsed_args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     else:
-        logging.getLogger().setLevel(getattr(logging, parsed_args.log_level))
+        logging.getLogger().setLevel(getattr(logging, parsed_args.log_level, logging.INFO))
     
     logger.info("Starting tailshare")
     

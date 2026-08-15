@@ -62,7 +62,7 @@ class Config:
         config_dir.mkdir(parents=True, exist_ok=True)
         return config_dir / "config.yaml"
     
-    def _get_log_path(self) -> Path:
+    def get_log_path(self) -> Path:
         """Get the log file path.
         
         Returns:
@@ -218,10 +218,15 @@ def setup_logging() -> None:
     Creates log file at ~/.tailscale_share/log.txt and configures
     logging to write to both file and console.
     """
-    log_path = get_config()._get_log_path()
+    log_path = get_config().get_log_path()
     
     # Create log directory if needed
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Guard against duplicate handlers if called multiple times
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        return
     
     # Configure root logger
     logging.basicConfig(

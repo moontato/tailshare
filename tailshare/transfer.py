@@ -13,7 +13,6 @@ import stat
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from enum import Enum
 from typing import Any, Callable
 
@@ -633,7 +632,6 @@ class TransferManager:
         self._tasks: list[TransferTask] = []
         self._logger = logging.getLogger(__name__)
         self._lock = threading.Lock()
-        self._current_client: SFTPClient | None = None
         self._progress_callback: Any = None
     
     def queue_transfer(

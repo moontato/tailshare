@@ -57,7 +57,7 @@ from tailshare.transfer import (
     TransferDirection,
     SFTPClient,
 )
-from tailshare.config import get_config, setup_logging, expand_path
+from tailshare.config import get_config, setup_logging
 
 
 class FileBrowser(Vertical):
@@ -531,22 +531,6 @@ class TailshareApp(App[None]):
     #transfer-queue-fetch {
         height: auto;
     }
-    
-    .status-bar {
-        dock: bottom;
-        height: 1;
-        background: $primary-darken-2;
-    }
-    
-    .error-message {
-        color: $error;
-        background: $error-darken-1;
-    }
-    
-    .success-message {
-        color: $success;
-        background: $success-darken-1;
-    }
     """
     
     BINDINGS = [
@@ -665,9 +649,6 @@ class TailshareApp(App[None]):
             self._send_files()
         elif button_id == "btn-fetch":
             self._fetch_files()
-        elif button_id == "btn-clear":
-            self._transfer_manager.clear_completed()
-            self._update_queue_display()
     
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Handle device selection via row selection."""
@@ -1028,11 +1009,6 @@ class TailshareApp(App[None]):
                 title="Connection Failed",
                 severity="error",
             )
-    
-    def _refresh_remote_browser(self) -> None:
-        """Refresh the remote file browser."""
-        remote_browser = self.query_one("#remote-file-browser", RemoteFileBrowser)
-        remote_browser._refresh_entries()
     
     def _execute_transfers(self) -> None:
         """Execute queued transfers in background.

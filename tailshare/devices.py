@@ -11,7 +11,6 @@ import json
 import logging
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 
@@ -300,32 +299,6 @@ class DeviceDiscovery:
                 return device
         return None
     
-    def is_tailscale_running(self) -> bool:
-        """Check if Tailscale is running.
-        
-        Returns:
-            True if Tailscale appears to be running
-        """
-        try:
-            result = subprocess.run(
-                ["tailscale", "status", "--json"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            return result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return False
-    
-    def refresh(self) -> list[Device]:
-        """Refresh device list.
-        
-        Returns:
-            Updated list of devices
-        """
-        return self.discover()
-
-
 def discover_devices() -> list[Device]:
     """Convenience function to discover devices.
     

@@ -71,8 +71,10 @@ tailshare
 | `j/k` | Navigate file browser |
 | `Enter` | Select file/enter directory |
 | `r` | Refresh current view |
+| `R` | Refresh remote file browser (Fetch tab) |
 | `d` | Refresh device list |
 | `s` | Send selected files |
+| `f` | Fetch selected files |
 | `c` | Clear completed transfers |
 | `q` | Quit application |
 
