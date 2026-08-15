@@ -671,34 +671,38 @@ class TransferManager:
         source_path: str,
         target_path: str,
         device: Device,
-        is_folder: bool = False,
         username: str | None = None,
         password: str | None = None,
         direction: TransferDirection = TransferDirection.SEND,
     ) -> TransferTask:
         """Queue a file/folder transfer.
 
+        Folder vs. file is decided at execution time; callers never
+        need to tell the manager up front.
+
         Args:
-            source_path: Local path to transfer
-            target_path: Remote path destination
+            source_path: Local path to transfer (send) or remote path (fetch)
+            target_path: Remote path destination (send) or local path (fetch)
             device: Target device
-            is_folder: True if transferring a folder
             username: SSH username for authentication
             password: SSH password for authentication
             direction: Transfer direction (send or fetch)
 
         Returns:
             Created transfer task
+
+        Raises:
+            ValueError: If a path contains directory traversal sequences
         """
         if direction == TransferDirection.SEND:
-            source_path = validate_file_path(source_path, is_local=True)
+            source_path = validate_file_path(source_path, is_local=True, expand=True)
             # Target is a remote path: validate traversal without local expansion
             target_path = validate_file_path(target_path, is_local=False)
         else:
             # For fetch, source_path is remote, validate without abspath
             source_path = validate_file_path(source_path, is_local=False)
             # target_path is local and should be expanded and validated
-            target_path = validate_file_path(expand_path(target_path), is_local=True)
+            target_path = validate_file_path(target_path, is_local=True, expand=True)
 
         progress = TransferProgress(
             filename=os.path.basename(source_path),

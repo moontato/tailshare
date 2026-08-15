@@ -7,7 +7,6 @@ This module implements the terminal user interface with:
 - Status messages
 """
 
-import contextlib
 import os
 import threading
 from functools import partial
@@ -928,12 +927,10 @@ class TailshareApp(App[None]):
 
         # Queue the transfer
         try:
-            is_folder = os.path.isdir(self._selected_path)
             task = self._transfer_manager.queue_transfer(
                 self._selected_path,
                 remote_path,
                 self._selected_device,
-                is_folder,
                 username=user,
                 password=password,
             )
@@ -999,22 +996,10 @@ class TailshareApp(App[None]):
 
         # Queue the fetch
         try:
-            # Check if it's a directory using the persistent connection
-            is_folder = False
-            if self._remote_sftp_client is not None:
-                with contextlib.suppress(Exception):
-                    is_folder = (
-                        self._remote_sftp_client.is_remote_dir(
-                            self._selected_remote_path
-                        )
-                        is True
-                    )
-
             task = self._transfer_manager.queue_transfer(
                 self._selected_remote_path,
                 local_path,
                 self._selected_device,
-                is_folder,
                 username=user,
                 password=password,
                 direction=TransferDirection.FETCH,
