@@ -39,41 +39,6 @@ class Device:
         status = "online" if self.online else "offline"
         return f"{self.name} ({self.ip}) [{status}]"
 
-    def to_dict(self) -> dict[str, Any]:
-        """Convert device to dictionary.
-
-        Returns:
-            Dictionary representation of device
-        """
-        return {
-            "name": self.name,
-            "hostname": self.hostname,
-            "ip": self.ip,
-            "online": self.online,
-            "last_seen": self.last_seen,
-            "machine_id": self.machine_id,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Device":
-        """Create device from dictionary.
-
-        Args:
-            data: Dictionary with device information
-
-        Returns:
-            Device instance
-        """
-        return cls(
-            name=data.get("name", "unknown"),
-            hostname=data.get("hostname", "unknown"),
-            ip=data.get("ip", "0.0.0.0"),
-            online=data.get("online", False),
-            last_seen=data.get("last_seen"),
-            machine_id=data.get("machine_id", ""),
-        )
-
-
 class DeviceDiscoveryError(Exception):
     """Exception raised when device discovery fails."""
     pass
@@ -276,28 +241,6 @@ class DeviceDiscovery:
             List of devices (may be empty if not discovered yet)
         """
         return self._devices.copy()
-
-    def get_online_devices(self) -> list[Device]:
-        """Get only online devices.
-
-        Returns:
-            List of online devices
-        """
-        return [d for d in self._devices if d.online]
-
-    def get_device_by_ip(self, ip: str) -> Device | None:
-        """Get device by IP address.
-
-        Args:
-            ip: Tailscale IP address
-
-        Returns:
-            Device if found, None otherwise
-        """
-        for device in self._devices:
-            if device.ip == ip:
-                return device
-        return None
 
     def get_device_by_name(self, name: str) -> Device | None:
         """Get device by name.

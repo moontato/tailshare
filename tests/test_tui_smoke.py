@@ -4,10 +4,12 @@ import subprocess
 from unittest.mock import patch
 
 import pytest
-from textual.widgets import DataTable
+from textual.widgets import DataTable, Label, TabbedContent
 
 import tailshare.config as config_module
-from tailshare.tui import TailshareApp
+from tailshare.devices import Device
+from tailshare.transfer import TransferDirection
+from tailshare.tui import TailshareApp, TransferQueue
 
 
 @pytest.fixture(autouse=True)
@@ -78,5 +80,74 @@ class TestAppSmoke:
                 for key in ("d", "s", "f", "c", "r", "R", "escape", "j", "k"):
                     await pilot.press(key)
                     await pilot.pause()
+                await pilot.press("q")
+                await pilot.pause()
+
+    async def test_queue_tabs_filter_by_direction_with_chips(self, monkeypatch) -> None:
+        """Each queue panel shows only its own direction, and the status
+        chips update even before a worker has started."""
+
+        def tailscale_missing(*args, **kwargs):
+            raise FileNotFoundError("tailscale")
+
+        monkeypatch.setattr(subprocess, "run", tailscale_missing)
+
+        device = Device(
+            name="dev",
+            hostname="dev",
+            ip="100.64.0.5",
+            online=True,
+            last_seen=None,
+            machine_id="m-dev",
+        )
+
+        app = TailshareApp()
+        with patch.object(app, "_refresh_device_list"):
+            async with app.run_test(size=(120, 35)) as pilot:
+                await pilot.pause()
+
+                app._transfer_manager.queue_transfer(
+                    "/tmp/a.txt", "remote/a.txt", device,
+                    direction=TransferDirection.SEND,
+                )
+                app._transfer_manager.queue_transfer(
+                    "remote/f.bin", "/tmp/out", device,
+                    direction=TransferDirection.FETCH,
+                )
+
+                # First refresh before a worker exists: chips update,
+                # the queue panel waits for the worker (by design)
+                app._update_queue_display()
+                await pilot.pause()
+
+                # Simulate the worker being active, then refresh
+                app._queue_update_enabled = True
+                app._update_queue_display()
+                await pilot.pause()
+
+                send_chip = app.query_one("#send-status-chip", Label)
+                fetch_chip = app.query_one("#fetch-status-chip", Label)
+                assert "1 active" in str(send_chip.render())
+                assert "1 active" in str(fetch_chip.render())
+
+                # Send tab (active by default) shows only send tasks
+                send_queue = app.query_one("#transfer-queue", TransferQueue)
+                assert len(send_queue._tasks) == 1
+                assert all(
+                    t.direction is TransferDirection.SEND for t in send_queue._tasks
+                )
+
+                # Switch to the fetch tab: its panel shows only fetch tasks
+                tabs = app.query_one("#transfer-tabs", TabbedContent)
+                tabs.active = "fetch-tab"
+                app._update_queue_display()
+                await pilot.pause()
+
+                fetch_queue = app.query_one("#transfer-queue-fetch", TransferQueue)
+                assert len(fetch_queue._tasks) == 1
+                assert all(
+                    t.direction is TransferDirection.FETCH for t in fetch_queue._tasks
+                )
+
                 await pilot.press("q")
                 await pilot.pause()

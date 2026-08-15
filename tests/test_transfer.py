@@ -118,6 +118,30 @@ class TestTransferTask:
         assert task.completed_at is not None
         assert progress.percentage == 100.0
 
+    def test_task_repr_hides_password(self) -> None:
+        """Test that the credential never appears in the task repr."""
+        device = Device(
+            name="test-pc",
+            hostname="test-pc",
+            ip="100.64.0.1",
+            online=True,
+            last_seen=None,
+            machine_id="",
+        )
+        progress = TransferProgress(filename="test.txt")
+
+        task = TransferTask(
+            source_path="/local/test.txt",
+            target_path="/remote/test.txt",
+            device=device,
+            progress=progress,
+            username="admin",
+            password="hunter2",
+        )
+
+        assert "hunter2" not in repr(task)
+        assert task.password == "hunter2"
+
     def test_task_fail(self) -> None:
         """Test marking task as failed."""
         device = Device(

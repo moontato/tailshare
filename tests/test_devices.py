@@ -61,51 +61,6 @@ class TestDevice:
 
         assert "offline" in str(device)
 
-    def test_device_to_dict(self) -> None:
-        """Test converting device to dictionary."""
-        device = Device(
-            name="test-pc",
-            hostname="test-pc.local",
-            ip="100.64.0.1",
-            online=True,
-            last_seen="2024-01-01T00:00:00Z",
-            machine_id="machine123",
-        )
-
-        device_dict = device.to_dict()
-
-        assert device_dict["name"] == "test-pc"
-        assert device_dict["ip"] == "100.64.0.1"
-        assert device_dict["online"] is True
-
-    def test_device_from_dict(self) -> None:
-        """Test creating device from dictionary."""
-        device_dict = {
-            "name": "test-pc",
-            "hostname": "test-pc.local",
-            "ip": "100.64.0.1",
-            "online": True,
-            "last_seen": "2024-01-01T00:00:00Z",
-            "machine_id": "machine123",
-        }
-
-        device = Device.from_dict(device_dict)
-
-        assert device.name == "test-pc"
-        assert device.ip == "100.64.0.1"
-        assert device.online is True
-
-    def test_device_from_dict_defaults(self) -> None:
-        """Test creating device from incomplete dictionary."""
-        device_dict = {}
-
-        device = Device.from_dict(device_dict)
-
-        assert device.name == "unknown"
-        assert device.ip == "0.0.0.0"
-        assert device.online is False
-
-
 class TestDeviceDiscovery:
     """Tests for device discovery parsing."""
 
@@ -222,58 +177,6 @@ class TestDeviceDiscovery:
         devices = discovery._parse_status(status_data)
 
         assert len(devices) == 0
-
-    def test_get_online_devices(self, discovery: DeviceDiscovery) -> None:
-        """Test filtering online devices."""
-        discovery._devices = [
-            Device(
-                name="online-pc",
-                hostname="online-pc",
-                ip="100.64.0.1",
-                online=True,
-                last_seen=None,
-                machine_id="",
-            ),
-            Device(
-                name="offline-pc",
-                hostname="offline-pc",
-                ip="100.64.0.2",
-                online=False,
-                last_seen=None,
-                machine_id="",
-            ),
-        ]
-
-        online = discovery.get_online_devices()
-
-        assert len(online) == 1
-        assert online[0].name == "online-pc"
-
-    def test_get_device_by_ip(self, discovery: DeviceDiscovery) -> None:
-        """Test finding device by IP."""
-        discovery._devices = [
-            Device(
-                name="test-pc",
-                hostname="test-pc",
-                ip="100.64.0.1",
-                online=True,
-                last_seen=None,
-                machine_id="",
-            ),
-        ]
-
-        device = discovery.get_device_by_ip("100.64.0.1")
-
-        assert device is not None
-        assert device.name == "test-pc"
-
-    def test_get_device_by_ip_not_found(self, discovery: DeviceDiscovery) -> None:
-        """Test finding non-existent device by IP."""
-        discovery._devices = []
-
-        device = discovery.get_device_by_ip("100.64.0.99")
-
-        assert device is None
 
     def test_get_device_by_name(self, discovery: DeviceDiscovery) -> None:
         """Test finding device by name."""

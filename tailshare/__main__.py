@@ -81,6 +81,10 @@ def main(args: list[str] | None = None) -> int:
 
     if parsed_args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+        # setup_logging() pins these to WARNING; unpin them so verbose
+        # mode actually shows library detail.
+        for name in ("paramiko", "asyncio"):
+            logging.getLogger(name).setLevel(logging.DEBUG)
     else:
         logging.getLogger().setLevel(getattr(logging, parsed_args.log_level, logging.INFO))
 

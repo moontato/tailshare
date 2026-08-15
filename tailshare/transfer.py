@@ -13,7 +13,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -90,7 +90,7 @@ class TransferTask:
         started_at: Transfer start time
         completed_at: Transfer completion time
         username: SSH username for authentication
-        password: SSH password for authentication
+        password: SSH password for authentication (excluded from repr)
         direction: Transfer direction (send or fetch)
     """
 
@@ -103,7 +103,7 @@ class TransferTask:
     started_at: float | None = None
     completed_at: float | None = None
     username: str | None = None
-    password: str | None = None
+    password: str | None = field(default=None, repr=False)
     direction: TransferDirection = TransferDirection.SEND
 
     def start(self) -> None:
@@ -131,6 +131,12 @@ class TransferTask:
 class TransferError(Exception):
     """Exception raised when transfer fails."""
     pass
+
+
+# Maximum recursion depth for folder transfers. Guards against symlink
+# loops on the remote host (a directory symlink to an ancestor would
+# otherwise recurse forever).
+MAX_FOLDER_DEPTH = 64
 
 
 class SFTPClient:
@@ -518,7 +524,8 @@ class SFTPClient:
         except OSError as e:
             raise TransferError(f"Remote file not found: {source_path}: {e}") from e
 
-        file_size = remote_stat.st_size
+        # st_size can be None for non-regular files on some SFTP servers
+        file_size = remote_stat.st_size or 0
         progress = TransferProgress(filename=os.path.basename(source_path))
 
         self._logger.debug(
@@ -552,6 +559,7 @@ class SFTPClient:
         source_path: str,
         target_path: str,
         progress_callback: Callable[[TransferProgress], None] | None = None,
+        depth: int = 0,
     ) -> None:
         """Fetch a folder recursively via SFTP.
 
@@ -559,12 +567,20 @@ class SFTPClient:
             source_path: Remote folder path
             target_path: Local folder path
             progress_callback: Optional callback for progress updates
+            depth: Recursion depth (internal; guards symlink loops)
 
         Raises:
             TransferError: If fetch fails
         """
         if not self._sftp_client:
             raise TransferError("Not connected. Call connect() first.")
+
+        if depth >= MAX_FOLDER_DEPTH:
+            self._logger.warning(
+                f"Aborting folder fetch at {source_path}: exceeded maximum "
+                f"depth {MAX_FOLDER_DEPTH} (possible symlink loop)"
+            )
+            return
 
         # Handle ~ in remote path
         if source_path == "~":
@@ -588,9 +604,6 @@ class SFTPClient:
         except TransferError as e:
             raise TransferError(f"Cannot browse remote directory: {e}") from e
 
-        # Create local directory
-        os.makedirs(target_path, exist_ok=True)
-
         # Process entries
         for name, is_dir in entries:
             remote_entry = os.path.join(source_path, name)
@@ -601,6 +614,7 @@ class SFTPClient:
                     remote_entry,
                     local_entry,
                     progress_callback,
+                    depth + 1,
                 )
             else:
                 self.fetch_file(
@@ -632,22 +646,6 @@ class SFTPClient:
                 self._logger.debug(f"mkdir failed for {path}: {e}")
                 # It might already exist or be a file; we'll let put() fail if so
                 pass
-
-    def test_connection(self) -> tuple[bool, str]:
-        """Test if connection to device is possible.
-
-        Returns:
-            Tuple of (success, message)
-        """
-        try:
-            self.connect()
-            self.disconnect()
-            return True, "Connection successful"
-        except TransferError as e:
-            return False, str(e)
-        except Exception as e:
-            return False, f"Unexpected error: {e}"
-
 
 class TransferManager:
     """Manages file transfer tasks.
@@ -781,6 +779,10 @@ class TransferManager:
         Processes transfers sequentially, connecting to each device
         as needed. Loops until no pending tasks remain, so tasks
         queued during execution are picked up automatically.
+
+        Note: all tasks for the same device share the first task's
+        credentials; if you queue tasks for one device with different
+        usernames/passwords, only the first pair is used.
         """
         while True:
             pending = self.get_pending_tasks()

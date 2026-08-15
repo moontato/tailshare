@@ -97,15 +97,6 @@ class Config:
             else:
                 base[key] = value
 
-    def save_config(self) -> None:
-        """Save current configuration to file."""
-        try:
-            with open(self._config_path, "w") as f:
-                yaml.dump(self._config, f, default_flow_style=False, sort_keys=False)
-        except OSError as e:
-            logging.error(f"Failed to save config file: {e}")
-            raise
-
     def get(self, *keys: str, default: Any = None) -> Any:
         """Get a configuration value by key path.
 

@@ -360,6 +360,24 @@ class TestFetchFolder:
         with pytest.raises(TransferError, match="Cannot browse remote directory"):
             client.fetch_folder("/missing", str(tmp_path / "dest"))
 
+    def test_fetch_folder_stops_at_max_depth(
+        self, client, fake_sftp, tmp_path, monkeypatch
+    ) -> None:
+        """Symlink-loop guard: recursion must stop at MAX_FOLDER_DEPTH."""
+        monkeypatch.setattr(transfer_module, "MAX_FOLDER_DEPTH", 3)
+        fake_sftp.add_file("/top/f.txt", b"F")
+        # a directory that repeats itself forever (symlink to ancestor)
+        fake_sftp.add_file("/top/loop/loop/deep.txt", b"D")
+        fake_sftp.add_dir("/top/loop/loop/loop/loop")
+
+        target = tmp_path / "dest"
+        client.fetch_folder("/top", str(target))
+
+        assert (target / "f.txt").read_bytes() == b"F"
+        assert (target / "loop" / "loop" / "deep.txt").read_bytes() == b"D"
+        # recursion stopped at the cap; nothing deeper was created
+        assert not (target / "loop" / "loop" / "loop").exists()
+
 
 class TestTransferFolder:
     def test_send_folder_nested(self, client, fake_sftp, tmp_path) -> None:

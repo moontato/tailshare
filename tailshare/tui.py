@@ -49,17 +49,14 @@ class FileSelected(Message):
         super().__init__()
         self.dir_path = dir_path
         self.file_path = file_path
-    def __hash__(self) -> int:
-        return hash(self.file_path)
+
 
 class RemoteFileSelected(Message):
-    """Message sent when a file is selected."""
+    """Message sent when a remote file is selected."""
     def __init__(self, dir_path: str, file_path: str) -> None:
         super().__init__()
         self.dir_path = dir_path
         self.file_path = file_path
-    def __hash__(self) -> int:
-        return hash(self.file_path)
 
 
 class FileBrowser(Vertical):
@@ -630,6 +627,7 @@ class TailshareApp(App[None]):
                         yield Button("Send", id="btn-send", variant="primary")
 
                     with ScrollableContainer(id="transfer-queue-container"):
+                        yield Label("", id="send-status-chip")
                         yield TransferQueue(id="transfer-queue")
 
                 with TabPane("Fetch", id="fetch-tab"), Vertical(id="right-panel-fetch"):
@@ -647,6 +645,7 @@ class TailshareApp(App[None]):
                             yield Button("Fetch", id="btn-fetch", variant="primary")
 
                         with ScrollableContainer(id="transfer-queue-container-fetch"):
+                            yield Label("", id="fetch-status-chip")
                             yield TransferQueue(id="transfer-queue-fetch")
 
         yield Footer()
@@ -1076,16 +1075,13 @@ class TailshareApp(App[None]):
         remote_browser._refresh_entries()
 
     def _execute_transfers(self) -> None:
-        """Execute queued transfers in background.
+        """Execute queued transfers in background (runs in worker thread).
 
-        Loops until the queue is empty, picking up any tasks
-        queued during execution.
+        execute_queue() itself loops until the queue is empty, picking
+        up tasks queued while it runs.
         """
         try:
-            while True:
-                self._transfer_manager.execute_queue()
-                if not self._transfer_manager.get_pending_tasks():
-                    break
+            self._transfer_manager.execute_queue()
         finally:
             self.call_later(self._on_worker_finished)
 
@@ -1098,6 +1094,12 @@ class TailshareApp(App[None]):
             self._interval_token.stop()
             self._interval_token = None
 
+        # Refresh the display one last time, then restart the worker if
+        # a task slipped into the queue while it was winding down.
+        self._update_queue_display()
+        if self._transfer_manager.get_pending_tasks():
+            self._start_transfer_worker()
+
     def _on_transfer_progress(self, task: TransferTask) -> None:
         """Update queue display when transfer progress changes.
 
@@ -1106,19 +1108,52 @@ class TailshareApp(App[None]):
         """
         self.call_later(self._update_queue_display)
 
+    @staticmethod
+    def _format_status_chip(tasks: list[TransferTask]) -> str:
+        """Format a per-tab status chip from its task list."""
+        if not tasks:
+            return "[dim]Idle[/dim]"
+        active = sum(1 for t in tasks if t.status in ("pending", "transferring"))
+        done = sum(1 for t in tasks if t.status == "completed")
+        failed = sum(1 for t in tasks if t.status == "failed")
+        parts: list[str] = []
+        if active:
+            parts.append(f"[blue]⏳ {active} active[/blue]")
+        if done:
+            parts.append(f"[green]✓ {done} done[/green]")
+        if failed:
+            parts.append(f"[red]✗ {failed} failed[/red]")
+        return "  ".join(parts)
+
     def _update_queue_display(self) -> None:
-        """Update the transfer queue display."""
+        """Update the transfer queue display and per-tab status chips."""
+        all_tasks = self._transfer_manager.get_all_tasks()
+        send_tasks = [
+            t for t in all_tasks if t.direction is TransferDirection.SEND
+        ]
+        fetch_tasks = [
+            t for t in all_tasks if t.direction is TransferDirection.FETCH
+        ]
+
+        # Status chips update regardless of worker state
+        self.query_one("#send-status-chip", Label).update(
+            self._format_status_chip(send_tasks)
+        )
+        self.query_one("#fetch-status-chip", Label).update(
+            self._format_status_chip(fetch_tasks)
+        )
+
         if not self._queue_update_enabled:
             return
 
-        # Update the current tab's queue
+        # Update the current tab's queue (each tab shows its own direction)
         current_tab = self.query_one("#transfer-tabs", TabbedContent).active_pane
         if current_tab.id == "send-tab":
             queue_widget = self.query_one("#transfer-queue", TransferQueue)
+            tasks = send_tasks
         else:
             queue_widget = self.query_one("#transfer-queue-fetch", TransferQueue)
-
-        tasks = self._transfer_manager.get_all_tasks()
+            tasks = fetch_tasks
         queue_widget.update_tasks(tasks)
 
 

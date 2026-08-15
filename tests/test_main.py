@@ -51,6 +51,23 @@ class TestMain:
             tmp_path / ".config" / "tailshare" / "config.yaml"
         )
 
+    def test_verbose_unpins_library_loggers(self, monkeypatch) -> None:
+        """--verbose must lift the WARNING pin on paramiko/asyncio set by
+        setup_logging, otherwise verbose mode shows no library detail."""
+        import logging
+
+        monkeypatch.setattr(main_module, "run_app", lambda: None)
+
+        paramiko_level = logging.getLogger("paramiko").level
+        asyncio_level = logging.getLogger("asyncio").level
+        try:
+            main_module.main(["--verbose"])
+            assert logging.getLogger("paramiko").level == logging.DEBUG
+            assert logging.getLogger("asyncio").level == logging.DEBUG
+        finally:
+            logging.getLogger("paramiko").setLevel(paramiko_level)
+            logging.getLogger("asyncio").setLevel(asyncio_level)
+
     def test_version_matches_package(self, capsys) -> None:
         from tailshare import __version__
 
