@@ -1,6 +1,7 @@
 """SFTPClient and TransferManager tests against an in-memory SFTP filesystem."""
 
 import posixpath
+import threading
 import types
 
 import paramiko
@@ -10,7 +11,9 @@ import tailshare.config as config_module
 import tailshare.transfer as transfer_module
 from tailshare.devices import Device
 from tailshare.transfer import (
+    TRANSFER_CHUNK_SIZE,
     SFTPClient,
+    TransferCancelled,
     TransferDirection,
     TransferError,
     TransferManager,
@@ -18,6 +21,43 @@ from tailshare.transfer import (
 
 DIR_MODE = 0o40755
 FILE_MODE = 0o100644
+
+
+class FakeSFTPFile:
+    """In-memory stand-in for paramiko.SFTPFile (one open file).
+
+    Writes go straight into the tree (like a real SFTP session that
+    streams data to the server), so an aborted transfer leaves a
+    partial file behind until it is unlinked/removed.
+    """
+
+    def __init__(self, sftp: "FakeSFTP", path: str, mode: str) -> None:
+        self._sftp = sftp
+        self._norm = sftp._norm(path)
+        self._pos = 0
+        if "w" in mode:
+            sftp.tree[self._norm] = b""
+        elif self._norm not in sftp.tree:
+            raise FileNotFoundError(f"No such file: {path}")
+
+    def read(self, n: int = -1) -> bytes:
+        if self._sftp.read_hook:
+            self._sftp.read_hook(self._norm)
+        data = self._sftp.tree.get(self._norm) or b""
+        end = len(data) if n is None or n < 0 else self._pos + n
+        chunk = data[self._pos:end]
+        self._pos += len(chunk)
+        return chunk
+
+    def write(self, data: bytes) -> int:
+        if self._sftp.write_hook:
+            self._sftp.write_hook(self._norm)
+        existing = self._sftp.tree.get(self._norm) or b""
+        self._sftp.tree[self._norm] = existing + data
+        return len(data)
+
+    def close(self) -> None:
+        pass
 
 
 class FakeSFTP:
@@ -30,6 +70,10 @@ class FakeSFTP:
         self.stat_calls: list[str] = []
         self.mkdir_calls: list[str] = []
         self.closed = False
+        # Optional test hooks, called on every read/write with the
+        # normalized path (used to simulate cancellation mid-transfer).
+        self.read_hook = None
+        self.write_hook = None
 
     # -- path helpers -------------------------------------------------
     def _norm(self, path: str) -> str:
@@ -89,20 +133,14 @@ class FakeSFTP:
             raise NotADirectoryError(f"Parent is a file: {path}")
         self.tree[norm] = None
 
-    def put(self, localpath: str, remotepath: str, callback=None) -> None:
-        with open(localpath, "rb") as f:
-            data = f.read()
-        self.tree[self._norm(remotepath)] = data
-        if callback:
-            callback(len(data), len(data))
+    def file(self, path: str, mode: str = "r", bufsize: int = -1) -> FakeSFTPFile:
+        return FakeSFTPFile(self, path, mode)
 
-    def get(self, remotepath: str, localpath: str, callback=None) -> None:
-        data = self._require(remotepath)
-        assert data is not None
-        with open(localpath, "wb") as f:
-            f.write(data)
-        if callback:
-            callback(len(data), len(data))
+    def unlink(self, path: str) -> None:
+        norm = self._norm(path)
+        if norm not in self.tree:
+            raise FileNotFoundError(f"No such file: {path}")
+        del self.tree[norm]
 
     def close(self) -> None:
         self.closed = True
@@ -396,6 +434,94 @@ class TestTransferFolder:
             client.transfer_folder("/definitely/missing", "/remote")
 
 
+class TestTransferCancellation:
+    """Chunked transfers honour a cancel event mid-file/folder."""
+
+    def test_send_file_cancelled_before_start(
+        self, client, fake_sftp, tmp_path
+    ) -> None:
+        local = tmp_path / "a.txt"
+        local.write_bytes(b"hello")
+        cancel = threading.Event()
+        cancel.set()
+
+        with pytest.raises(TransferCancelled):
+            client.transfer_file(str(local), "/dest/a.txt", cancel_event=cancel)
+
+        assert "/dest/a.txt" not in fake_sftp.tree
+        assert local.read_bytes() == b"hello"
+
+    def test_send_file_cancelled_mid_transfer_removes_partial(
+        self, client, fake_sftp, tmp_path
+    ) -> None:
+        payload = b"x" * (TRANSFER_CHUNK_SIZE * 3)
+        local = tmp_path / "big.bin"
+        local.write_bytes(payload)
+        cancel = threading.Event()
+        fake_sftp.write_hook = lambda path: cancel.set()
+
+        with pytest.raises(TransferCancelled):
+            client.transfer_file(str(local), "/dest/big.bin", cancel_event=cancel)
+
+        # partial upload removed, local source untouched
+        assert "/dest/big.bin" not in fake_sftp.tree
+        assert local.read_bytes() == payload
+
+    def test_fetch_file_cancelled_mid_transfer_removes_partial(
+        self, client, fake_sftp, tmp_path
+    ) -> None:
+        fake_sftp.add_file("/remote/big.bin", b"y" * (TRANSFER_CHUNK_SIZE * 3))
+        target = tmp_path / "out" / "big.bin"
+        cancel = threading.Event()
+        fake_sftp.read_hook = lambda path: cancel.set()
+
+        with pytest.raises(TransferCancelled):
+            client.fetch_file("/remote/big.bin", str(target), cancel_event=cancel)
+
+        assert not target.exists()
+
+    def test_send_folder_cancelled_between_files(
+        self, client, fake_sftp, tmp_path
+    ) -> None:
+        src = tmp_path / "src"
+        (src / "sub").mkdir(parents=True)
+        (src / "a.txt").write_bytes(b"A")
+        (src / "sub" / "b.bin").write_bytes(b"BB")
+        cancel = threading.Event()
+
+        def hook(path):
+            if path == "/remote/dir/sub/b.bin":
+                cancel.set()
+
+        fake_sftp.write_hook = hook
+
+        with pytest.raises(TransferCancelled):
+            client.transfer_folder(str(src), "/remote/dir", cancel_event=cancel)
+
+        assert fake_sftp.tree["/remote/dir/a.txt"] == b"A"
+        assert "/remote/dir/sub/b.bin" not in fake_sftp.tree
+
+    def test_fetch_folder_cancelled_between_files(
+        self, client, fake_sftp, tmp_path
+    ) -> None:
+        fake_sftp.add_file("/top/a.txt", b"A" * 50)
+        fake_sftp.add_file("/top/b.bin", b"B" * (TRANSFER_CHUNK_SIZE * 2))
+        target = tmp_path / "dest"
+        cancel = threading.Event()
+
+        def hook(path):
+            if path == "/top/b.bin":
+                cancel.set()
+
+        fake_sftp.read_hook = hook
+
+        with pytest.raises(TransferCancelled):
+            client.fetch_folder("/top", str(target), cancel_event=cancel)
+
+        assert (target / "a.txt").read_bytes() == b"A" * 50
+        assert not (target / "b.bin").exists()
+
+
 class TestEnsureRemoteDir:
     def test_creates_parent_chain(self, client, fake_sftp) -> None:
         client._ensure_remote_dir("/a/b/c")
@@ -589,3 +715,79 @@ class TestExecuteQueue:
         manager.execute_queue()
 
         assert created[0]._sftp_client is None  # disconnect() ran
+
+    def test_cancelled_pending_task_is_skipped(self, monkeypatch, tmp_path) -> None:
+        fs = FakeSFTP()
+        self._make_factory(monkeypatch, shared=fs)
+        manager = TransferManager()
+        f1 = tmp_path / "one.txt"
+        f1.write_bytes(b"1")
+        f2 = tmp_path / "two.txt"
+        f2.write_bytes(b"2")
+        t1 = manager.queue_transfer(str(f1), "r/one.txt", self._device())
+        t2 = manager.queue_transfer(str(f2), "r/two.txt", self._device())
+
+        manager.cancel_task(t1)
+
+        manager.execute_queue()
+
+        assert t1.status == "cancelled"
+        assert t2.status == "completed"
+        assert "/r/one.txt" not in fs.tree
+        assert fs.tree.get("/r/two.txt") == b"2"
+
+    def test_cancel_during_transfer_marks_cancelled_and_queue_continues(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        fs = FakeSFTP()
+        self._make_factory(monkeypatch, shared=fs)
+        manager = TransferManager()
+        f1 = tmp_path / "one.bin"
+        f1.write_bytes(b"1" * (TRANSFER_CHUNK_SIZE * 2))
+        f2 = tmp_path / "two.txt"
+        f2.write_bytes(b"2")
+        t1 = manager.queue_transfer(str(f1), "r/one.bin", self._device())
+        t2 = manager.queue_transfer(str(f2), "r/two.txt", self._device())
+
+        def progress_callback(task) -> None:
+            if task is t1 and not t1.cancel_event.is_set():
+                manager.cancel_task(t1)
+
+        manager.set_progress_callback(progress_callback)
+
+        manager.execute_queue()
+
+        assert t1.status == "cancelled"
+        assert t2.status == "completed"
+        assert "/r/one.bin" not in fs.tree
+        assert fs.tree.get("/r/two.txt") == b"2"
+        assert t1 not in manager.get_all_tasks()
+
+    def test_cancel_task_removes_task_from_manager(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        self._make_factory(monkeypatch)
+        manager = TransferManager()
+        f1 = tmp_path / "one.txt"
+        f1.write_bytes(b"1")
+        t1 = manager.queue_transfer(str(f1), "r/one.txt", self._device())
+
+        manager.cancel_task(t1)
+
+        assert t1.status == "cancelled"
+        assert t1.cancel_event.is_set()
+        assert t1 not in manager.get_all_tasks()
+
+    def test_clear_completed_removes_cancelled_tasks(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        self._make_factory(monkeypatch)
+        manager = TransferManager()
+        f1 = tmp_path / "one.txt"
+        f1.write_bytes(b"1")
+        t1 = manager.queue_transfer(str(f1), "r/one.txt", self._device())
+
+        manager.cancel_task(t1)
+        manager.clear_completed()
+
+        assert manager.get_all_tasks() == []

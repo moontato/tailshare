@@ -12,6 +12,7 @@ import os
 import stat
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -85,13 +86,16 @@ class TransferTask:
         target_path: Remote path on target device
         device: Target device
         progress: Transfer progress tracker
-        status: Current status (pending, transferring, completed, failed)
+        status: Current status (pending, transferring, completed, failed,
+            cancelled)
         error: Error message if failed
         started_at: Transfer start time
         completed_at: Transfer completion time
         username: SSH username for authentication
         password: SSH password for authentication (excluded from repr)
         direction: Transfer direction (send or fetch)
+        task_id: Unique identifier (stable row key for the TUI queue)
+        cancel_event: Set to request cancellation of this task
     """
 
     source_path: str
@@ -105,6 +109,10 @@ class TransferTask:
     username: str | None = None
     password: str | None = field(default=None, repr=False)
     direction: TransferDirection = TransferDirection.SEND
+    task_id: str = field(default_factory=lambda: uuid.uuid4().hex, repr=False)
+    cancel_event: threading.Event = field(
+        default_factory=threading.Event, repr=False
+    )
 
     def start(self) -> None:
         """Mark transfer as started."""
@@ -127,9 +135,22 @@ class TransferTask:
         self.error = error
         self.completed_at = time.time()
 
+    def cancel(self) -> None:
+        """Request cancellation of this transfer.
+
+        A pending task is dropped by the queue; a transferring task
+        stops at the next chunk boundary and is marked cancelled.
+        """
+        self.cancel_event.set()
+
 
 class TransferError(Exception):
     """Exception raised when transfer fails."""
+    pass
+
+
+class TransferCancelled(TransferError):
+    """Raised when a transfer is cancelled while in progress."""
     pass
 
 
@@ -137,6 +158,11 @@ class TransferError(Exception):
 # loops on the remote host (a directory symlink to an ancestor would
 # otherwise recurse forever).
 MAX_FOLDER_DEPTH = 64
+
+# Read/write chunk size for file transfers. Files are copied in chunks
+# (rather than in one blocking put/get) so a cancellation request is
+# honoured promptly, mid-file.
+TRANSFER_CHUNK_SIZE = 32 * 1024
 
 
 class SFTPClient:
@@ -275,6 +301,7 @@ class SFTPClient:
         source_path: str,
         target_path: str,
         progress_callback: Callable[[TransferProgress], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """Transfer a single file via SFTP.
 
@@ -282,9 +309,13 @@ class SFTPClient:
             source_path: Local file path
             target_path: Remote file path
             progress_callback: Optional callback for progress updates
+            cancel_event: Optional event; when set, the transfer aborts
+                at the next chunk boundary and the partial remote file
+                is removed
 
         Raises:
             TransferError: If transfer fails
+            TransferCancelled: If cancellation is requested
         """
         if not self._sftp_client:
             raise TransferError("Not connected. Call connect() first.")
@@ -326,22 +357,42 @@ class SFTPClient:
         except (OSError, FileNotFoundError):
             pass
 
-        # Transfer file with progress tracking
+        # Transfer the file in chunks (mirroring paramiko's own put()
+        # implementation) so a cancellation request is honoured between
+        # chunks instead of after the whole file.
         start_time = time.time()
 
         self._logger.info(f"SFTP PUT: {source_path} -> {target_path}")
 
-        def progress_hook(transferred: int, total: int | None = None) -> None:
-            progress.update(transferred, file_size)
-            progress.update_speed(time.time() - start_time)
-            if progress_callback:
-                progress_callback(progress)
-
-        self._sftp_client.put(
-            source_path,
-            target_path,
-            callback=progress_hook,
-        )
+        transferred = 0
+        remote_file = self._sftp_client.file(target_path, "wb")
+        try:
+            with open(source_path, "rb") as local_file:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise TransferCancelled(
+                            f"Transfer cancelled: {os.path.basename(source_path)}"
+                        )
+                    chunk = local_file.read(TRANSFER_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    remote_file.write(chunk)
+                    transferred += len(chunk)
+                    progress.update(transferred, file_size)
+                    progress.update_speed(time.time() - start_time)
+                    if progress_callback:
+                        progress_callback(progress)
+        except TransferCancelled:
+            # Do not leave a half-written file on the remote host.
+            try:
+                self._sftp_client.unlink(target_path)
+            except OSError as e:
+                self._logger.debug(
+                    f"Could not remove partial remote file {target_path}: {e}"
+                )
+            raise
+        finally:
+            remote_file.close()
 
         progress.update(file_size, file_size)
         if progress_callback:
@@ -354,6 +405,7 @@ class SFTPClient:
         source_path: str,
         target_path: str,
         progress_callback: Callable[[TransferProgress], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """Transfer a folder recursively via SFTP.
 
@@ -361,9 +413,12 @@ class SFTPClient:
             source_path: Local folder path
             target_path: Remote folder path
             progress_callback: Optional callback for progress updates
+            cancel_event: Optional event; when set, the folder transfer
+                aborts after the current file
 
         Raises:
             TransferError: If transfer fails
+            TransferCancelled: If cancellation is requested
         """
         if not self._sftp_client:
             raise TransferError("Not connected. Call connect() first.")
@@ -408,6 +463,10 @@ class SFTPClient:
         transferred = 0
 
         for source_file, target_file in files_to_transfer:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled(
+                    f"Transfer cancelled: {os.path.basename(source_path)}"
+                )
             file_size = os.path.getsize(source_file)
 
             def make_callback(
@@ -438,6 +497,7 @@ class SFTPClient:
                 source_file,
                 target_file,
                 make_callback(),
+                cancel_event,
             )
             transferred += file_size
 
@@ -484,6 +544,7 @@ class SFTPClient:
         source_path: str,
         target_path: str,
         progress_callback: Callable[[TransferProgress], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """Fetch a single file via SFTP.
 
@@ -491,9 +552,13 @@ class SFTPClient:
             source_path: Remote file path
             target_path: Local file path
             progress_callback: Optional callback for progress updates
+            cancel_event: Optional event; when set, the fetch aborts at
+                the next chunk boundary and the partial local file is
+                removed
 
         Raises:
             TransferError: If fetch fails
+            TransferCancelled: If cancellation is requested
         """
         if not self._sftp_client:
             raise TransferError("Not connected. Call connect() first.")
@@ -533,20 +598,38 @@ class SFTPClient:
         )
 
         start_time = time.time()
+        transferred = 0
 
         self._logger.info(f"SFTP GET: {source_path} -> {target_path}")
 
-        def progress_hook(transferred: int, total: int | None = None) -> None:
-            progress.update(transferred, file_size)
-            progress.update_speed(time.time() - start_time)
-            if progress_callback:
-                progress_callback(progress)
-
-        self._sftp_client.get(
-            source_path,
-            target_path,
-            callback=progress_hook,
-        )
+        remote_file = self._sftp_client.file(source_path, "rb")
+        try:
+            with open(target_path, "wb") as local_file:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise TransferCancelled(
+                            f"Fetch cancelled: {os.path.basename(source_path)}"
+                        )
+                    chunk = remote_file.read(TRANSFER_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    local_file.write(chunk)
+                    transferred += len(chunk)
+                    progress.update(transferred, file_size)
+                    progress.update_speed(time.time() - start_time)
+                    if progress_callback:
+                        progress_callback(progress)
+        except TransferCancelled:
+            # Do not leave a half-downloaded file behind.
+            try:
+                os.remove(target_path)
+            except OSError as e:
+                self._logger.debug(
+                    f"Could not remove partial local file {target_path}: {e}"
+                )
+            raise
+        finally:
+            remote_file.close()
 
         progress.update(file_size, file_size)
         if progress_callback:
@@ -560,6 +643,7 @@ class SFTPClient:
         target_path: str,
         progress_callback: Callable[[TransferProgress], None] | None = None,
         depth: int = 0,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """Fetch a folder recursively via SFTP.
 
@@ -568,9 +652,12 @@ class SFTPClient:
             target_path: Local folder path
             progress_callback: Optional callback for progress updates
             depth: Recursion depth (internal; guards symlink loops)
+            cancel_event: Optional event; when set, the folder fetch
+                aborts after the current entry
 
         Raises:
             TransferError: If fetch fails
+            TransferCancelled: If cancellation is requested
         """
         if not self._sftp_client:
             raise TransferError("Not connected. Call connect() first.")
@@ -606,6 +693,10 @@ class SFTPClient:
 
         # Process entries
         for name, is_dir in entries:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelled(
+                    f"Fetch cancelled: {os.path.basename(source_path)}"
+                )
             remote_entry = os.path.join(source_path, name)
             local_entry = os.path.join(target_path, name)
 
@@ -615,12 +706,14 @@ class SFTPClient:
                     local_entry,
                     progress_callback,
                     depth + 1,
+                    cancel_event,
                 )
             else:
                 self.fetch_file(
                     remote_entry,
                     local_entry,
                     progress_callback,
+                    cancel_event,
                 )
 
     def _ensure_remote_dir(self, path: str) -> None:
@@ -726,34 +819,41 @@ class TransferManager:
         return task
 
     def cancel_task(self, task: TransferTask) -> None:
-        """Cancel a pending transfer task.
+        """Cancel a transfer task and remove it from the queue.
+
+        Pending tasks are dropped immediately. A task that is already
+        transferring is signalled to stop at the next chunk boundary;
+        the worker marks it cancelled.
 
         Args:
             task: Task to cancel
         """
         with self._lock:
+            task.cancel_event.set()
+            if task.status == "pending":
+                task.status = "cancelled"
             if task in self._tasks:
                 self._tasks.remove(task)
-                self._logger.info(f"Cancelled transfer: {task.source_path}")
+        self._logger.info(f"Cancelled transfer: {task.source_path}")
 
     def clear_completed(self) -> None:
-        """Remove completed and failed tasks from queue."""
+        """Remove completed, failed and cancelled tasks from queue."""
         with self._lock:
             self._tasks = [
                 t for t in self._tasks
-                if t.status not in ("completed", "failed")
+                if t.status not in ("completed", "failed", "cancelled")
             ]
 
     def get_pending_tasks(self) -> list[TransferTask]:
         """Get list of pending/active tasks.
 
         Returns:
-            List of tasks not yet completed or failed
+            List of tasks not yet completed, failed or cancelled
         """
         with self._lock:
             return [
                 t for t in self._tasks
-                if t.status not in ("completed", "failed")
+                if t.status not in ("completed", "failed", "cancelled")
             ]
 
     def get_all_tasks(self) -> list[TransferTask]:
@@ -779,6 +879,11 @@ class TransferManager:
         Processes transfers sequentially, connecting to each device
         as needed. Loops until no pending tasks remain, so tasks
         queued during execution are picked up automatically.
+
+        Tasks can be cancelled at any time via cancel_task(): pending
+        tasks are skipped, transferring tasks stop at the next chunk
+        boundary and are marked cancelled; the queue then continues
+        with the remaining tasks.
 
         Note: all tasks for the same device share the first task's
         credentials; if you queue tasks for one device with different
@@ -823,6 +928,16 @@ class TransferManager:
                         continue
 
                     for task in tasks:
+                        # The task may have been cancelled while this
+                        # batch was being assembled; skip it instead of
+                        # starting a new transfer.
+                        if task.cancel_event.is_set():
+                            task.status = "cancelled"
+                            self._logger.info(
+                                f"Transfer skipped (cancelled): {task.source_path}"
+                            )
+                            continue
+
                         try:
                             task.start()
 
@@ -841,12 +956,14 @@ class TransferManager:
                                         remote_path,
                                         task.target_path,
                                         lambda p, t=task: self._update_progress(t, p),
+                                        cancel_event=task.cancel_event,
                                     )
                                 else:
                                     client.fetch_file(
                                         remote_path,
                                         task.target_path,
                                         lambda p, t=task: self._update_progress(t, p),
+                                        cancel_event=task.cancel_event,
                                     )
                             else:
                                 if os.path.isdir(task.source_path):
@@ -854,17 +971,26 @@ class TransferManager:
                                         task.source_path,
                                         task.target_path,
                                         lambda p, t=task: self._update_progress(t, p),
+                                        cancel_event=task.cancel_event,
                                     )
                                 else:
                                     client.transfer_file(
                                         task.source_path,
                                         task.target_path,
                                         lambda p, t=task: self._update_progress(t, p),
+                                        cancel_event=task.cancel_event,
                                     )
 
                             task.complete()
                             self._logger.info(
                                 f"Transfer complete: {task.source_path}"
+                            )
+
+                        except TransferCancelled:
+                            task.status = "cancelled"
+                            task.completed_at = time.time()
+                            self._logger.info(
+                                f"Transfer cancelled: {task.source_path}"
                             )
 
                         except TransferError as e:
