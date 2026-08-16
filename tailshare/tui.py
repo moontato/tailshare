@@ -457,12 +457,17 @@ class TransferQueueTable(DataTable):
         self._set_name_width()
 
     def _add_columns(self) -> None:
-        """Add columns once (idempotent)."""
+        """Add columns once (idempotent).
+
+        Fixed columns are sized to fit their header and the widest
+        content they can hold (status icons, progress text or the
+        18-char truncated error text, and the cancel glyph).
+        """
         if self.columns:
             return
-        self.add_column("Status", key="status", width=3)
+        self.add_column("Status", key="status", width=6)
         self.add_column("Name", key="name")
-        self.add_column("Progress", key="progress", width=10)
+        self.add_column("Progress", key="progress", width=18)
         self.add_column("✕", key=self.CANCEL_COLUMN, width=2)
 
     def _set_name_width(self) -> None:
@@ -472,7 +477,7 @@ class TransferQueueTable(DataTable):
         if column is None:
             return
         # Fixed contribution of the other columns, padding and row label
-        fixed = 3 + 10 + 2 + 2 * self.cell_padding * 4 + 4
+        fixed = 6 + 18 + 2 + 2 * self.cell_padding * 4 + 4
         column.width = max(self.container_size.width - fixed, 10)
         column.auto_width = False
 
@@ -647,6 +652,13 @@ class TailshareApp(App[None]):
 
     #transfer-queue-fetch {
         height: 1fr;
+    }
+
+    #transfer-queue > .datatable--hover,
+    #transfer-queue > .datatable--header-hover,
+    #transfer-queue-fetch > .datatable--hover,
+    #transfer-queue-fetch > .datatable--header-hover {
+        background: transparent;
     }
     """
 

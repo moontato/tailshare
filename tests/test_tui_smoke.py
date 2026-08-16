@@ -211,6 +211,17 @@ class TestQueueRemoval:
                 assert send_queue.get_cell_at((0, 3)) == "✕"
                 assert task.task_id in send_queue._row_tasks
 
+                # Fixed columns are wide enough for header and content
+                assert send_queue.columns["status"].width == 6
+                assert send_queue.columns["progress"].width == 18
+                assert send_queue.columns["cancel"].width == 2
+                assert send_queue.columns["name"].width >= 10
+
+                # Hover highlighting is suppressed on the queue tables
+                for pseudo in ("datatable--hover", "datatable--header-hover"):
+                    styles = send_queue._component_styles[pseudo]
+                    assert styles.base.background.is_transparent
+
                 await pilot.press("q")
                 await pilot.pause()
 
