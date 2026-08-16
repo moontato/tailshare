@@ -74,13 +74,16 @@ tailshare --version
 |-----|--------|
 | `j` / `k` | Navigate file browser |
 | `Enter` | Select file / enter directory |
+| `x` / `Delete` | Remove the selected job from the transfer queue (cancels it if already transferring) |
 | `r` | Refresh current view |
 | `R` | Refresh remote file browser (Fetch tab) |
 | `d` | Refresh device list |
 | `s` | Send selected files |
 | `f` | Fetch selected files |
-| `c` | Clear completed transfers |
+| `c` | Clear finished (completed/failed) transfers |
 | `q` | Quit application |
+
+Each transfer queue row also has a clickable **✕** column — clicking it removes that job (a job that is already transferring is cancelled instead, at the next chunk boundary, and any half-written file is cleaned up).
 
 ### Configuration
 

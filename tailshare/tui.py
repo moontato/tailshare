@@ -411,58 +411,153 @@ class RemoteFileBrowser(Vertical):
         self.focus()
 
 
-class TransferQueue(Label):
-    """Widget displaying transfer queue and progress."""
+class TransferQueueTable(DataTable):
+    """Transfer queue with per-row remove/cancel support.
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__("", *args, **kwargs)
-        self._tasks: list[TransferTask] = []
+    Each row shows one queued task. The trailing column renders an "✕"
+    for tasks that can still be stopped. Clicking it (or focusing the
+    row and pressing x / delete) removes the task from the queue; a
+    task that is already transferring is cancelled instead, stopping
+    at the next chunk boundary.
+    """
+
+    CANCEL_COLUMN = "cancel"
+
+    BINDINGS = [
+        Binding("x", "remove_job", "Remove job"),
+        Binding("delete", "remove_job", "Remove job", show=False),
+    ]
+
+    STATUS_ICONS = {
+        "pending": "⏳",
+        "transferring": "▶",
+        "completed": "✓",
+        "failed": "✗",
+        "cancelled": "⊘",
+    }
+
+    def __init__(
+        self,
+        manager: TransferManager,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._manager = manager
+        self._row_keys: list[str] = []
+        self._row_tasks: dict[str, TransferTask] = {}
+
+    def on_mount(self) -> None:
+        """Add the queue columns."""
+        self._add_columns()
+        self.call_after_refresh(self._set_name_width)
+
+    def on_resize(self, event: Resize) -> None:
+        """Keep the Name column sized to the table width."""
+        self._set_name_width()
+
+    def _add_columns(self) -> None:
+        """Add columns once (idempotent).
+
+        Fixed columns are sized to fit their header and the widest
+        content they can hold (status icons, progress text or the
+        18-char truncated error text, and the cancel glyph).
+        """
+        if self.columns:
+            return
+        self.add_column("Status", key="status", width=6)
+        self.add_column("Name", key="name")
+        self.add_column("Progress", key="progress", width=18)
+        self.add_column("✕", key=self.CANCEL_COLUMN, width=2)
+
+    def _set_name_width(self) -> None:
+        """Size the Name column to the remaining table width."""
+        self._add_columns()
+        column = self.columns.get("name")
+        if column is None:
+            return
+        # Fixed contribution of the other columns, padding and row label
+        fixed = 6 + 18 + 2 + 2 * self.cell_padding * 4 + 4
+        column.width = max(self.container_size.width - fixed, 10)
+        column.auto_width = False
+
+    @staticmethod
+    def _progress_text(task: TransferTask) -> str:
+        """Short progress/error text for the Progress column."""
+        if task.status == "transferring":
+            return f"{task.progress.percentage:.0f}%"
+        if task.status == "failed":
+            return (task.error or "error")[:18]
+        return {
+            "pending": "",
+            "completed": "done",
+            "cancelled": "cancelled",
+        }.get(task.status, "")
+
+    def _row_values(self, task: TransferTask) -> tuple[str, str, str, str]:
+        """Cell values for one task row."""
+        cancellable = task.status in ("pending", "transferring")
+        return (
+            self.STATUS_ICONS.get(task.status, "?"),
+            task.progress.filename,
+            self._progress_text(task),
+            "✕" if cancellable else "",
+        )
 
     def update_tasks(self, tasks: list[TransferTask]) -> None:
-        """Update the displayed tasks.
+        """Update the table from the manager's task list.
 
-        Args:
-            tasks: List of current transfer tasks
+        Rows are rebuilt only when the set of tasks changed; otherwise
+        just the status/progress cells are refreshed so the cursor
+        position survives the periodic updates.
         """
-        self._tasks = tasks
-        if not self._tasks:
-            self.update("[dim]No pending transfers[/dim]")
+        keys = [task.task_id for task in tasks]
+        if keys != self._row_keys:
+            self._add_columns()
+            self.clear()
+            self._row_tasks = {}
+            self._row_keys = []
+            for task in tasks:
+                self.add_row(*self._row_values(task), key=task.task_id)
+                self._row_tasks[task.task_id] = task
+                self._row_keys.append(task.task_id)
+            return
+
+        for task in tasks:
+            icon, _name, progress_text, cancel = self._row_values(task)
+            self.update_cell(task.task_id, "status", icon)
+            self.update_cell(task.task_id, "progress", progress_text)
+            self.update_cell(task.task_id, self.CANCEL_COLUMN, cancel)
+
+    def action_remove_job(self) -> None:
+        """Remove the task under the cursor from the queue."""
+        if not 0 <= self.cursor_row < len(self._row_keys):
+            return
+        self._remove_task(self._row_keys[self.cursor_row])
+
+    def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
+        """Handle clicks on the cancel column."""
+        if event.cell_key.column_key == self.CANCEL_COLUMN:
+            self._remove_task(str(event.cell_key.row_key.value))
+        event.stop()
+
+    def _remove_task(self, task_id: str) -> None:
+        """Cancel/remove one task and refresh the display."""
+        task = self._row_tasks.get(task_id)
+        if task is None:
+            return
+
+        was_transferring = task.status == "transferring"
+        self._manager.cancel_task(task)
+        if was_transferring:
+            self.app.notify(
+                f"Cancelling {task.progress.filename}", title="Transfer"
+            )
         else:
-            lines = ["[b]Transfer Queue:[/b]", ""]
-
-            for i, task in enumerate(self._tasks, 1):
-                status_icon = {
-                    "pending": "[yellow]⏳[/yellow]",
-                    "transferring": "[blue]⏳[/blue]",
-                    "completed": "[green]✓[/green]",
-                    "failed": "[red]✗[/red]",
-                }.get(task.status, "?")
-
-                lines.append(
-                    f"{status_icon} [{i}] {task.progress.filename}"
-                )
-                if task.direction == TransferDirection.FETCH:
-                    lines.append(
-                        f"    ← {task.device.name}:{task.source_path}"
-                    )
-                else:
-                    lines.append(
-                        f"    → {task.device.name}:{task.target_path}"
-                    )
-
-                if task.status == "transferring":
-                    pct = task.progress.percentage
-                    lines.append(
-                        f"    [cyan]{pct:.1f}%[/cyan] "
-                        f"({task.progress.transferred / 1024:.1f} KB)"
-                    )
-
-                if task.error:
-                    lines.append(f"    [red]{task.error}[/red]")
-
-                lines.append("")
-
-            self.update("\n".join(lines))
+            self.app.notify(
+                f"Removed {task.progress.filename} from queue", title="Transfer"
+            )
+        self.app._update_queue_display()
 
 
 class TailshareApp(App[None]):
@@ -536,7 +631,7 @@ class TailshareApp(App[None]):
     }
 
     #transfer-queue {
-        height: auto;
+        height: 1fr;
     }
 
     #remote-file-browser-container {
@@ -556,7 +651,14 @@ class TailshareApp(App[None]):
     }
 
     #transfer-queue-fetch {
-        height: auto;
+        height: 1fr;
+    }
+
+    #transfer-queue > .datatable--hover,
+    #transfer-queue > .datatable--header-hover,
+    #transfer-queue-fetch > .datatable--hover,
+    #transfer-queue-fetch > .datatable--header-hover {
+        background: transparent;
     }
     """
 
@@ -628,7 +730,9 @@ class TailshareApp(App[None]):
 
                     with ScrollableContainer(id="transfer-queue-container"):
                         yield Label("", id="send-status-chip")
-                        yield TransferQueue(id="transfer-queue")
+                        yield TransferQueueTable(
+                            self._transfer_manager, id="transfer-queue"
+                        )
 
                 with TabPane("Fetch", id="fetch-tab"), Vertical(id="right-panel-fetch"):
                         yield Label("[b]Remote File Browser[/b]", id="remote-file-header")
@@ -646,7 +750,10 @@ class TailshareApp(App[None]):
 
                         with ScrollableContainer(id="transfer-queue-container-fetch"):
                             yield Label("", id="fetch-status-chip")
-                            yield TransferQueue(id="transfer-queue-fetch")
+                            yield TransferQueueTable(
+                                self._transfer_manager,
+                                id="transfer-queue-fetch",
+                            )
 
         yield Footer()
 
@@ -1146,15 +1253,13 @@ class TailshareApp(App[None]):
         if not self._queue_update_enabled:
             return
 
-        # Update the current tab's queue (each tab shows its own direction)
-        current_tab = self.query_one("#transfer-tabs", TabbedContent).active_pane
-        if current_tab.id == "send-tab":
-            queue_widget = self.query_one("#transfer-queue", TransferQueue)
-            tasks = send_tasks
-        else:
-            queue_widget = self.query_one("#transfer-queue-fetch", TransferQueue)
-            tasks = fetch_tasks
-        queue_widget.update_tasks(tasks)
+        # Each tab shows only its own direction
+        self.query_one("#transfer-queue", TransferQueueTable).update_tasks(
+            send_tasks
+        )
+        self.query_one(
+            "#transfer-queue-fetch", TransferQueueTable
+        ).update_tasks(fetch_tasks)
 
 
 def run_app() -> None:
