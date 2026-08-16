@@ -57,9 +57,15 @@ tailshare --version
 
 ### Sending files (Send tab)
 
-1. Navigate to the file or folder in the local file browser (`j`/`k`, `Enter`, `r` to refresh).
-2. Enter the remote destination path (default `~` = the remote home directory). `~`-relative and relative paths are allowed; `..` traversal is rejected.
-3. Click **Send** (or press `s`) to queue the transfer.
+1. Pick a device first — the **Destination** browser (right-hand panel) connects automatically and lists the remote home directory. It sits side-by-side with the local file browser so you can see both ends at once.
+2. Choose where to send:
+   - **Browse** the Destination panel — click a folder to enter it, `..` to go up. Entering a folder sets it as the destination.
+   - **Type** a path into the **Remote path** input at the bottom (commit with `Enter` or by clicking away).
+   - The two are always in sync: browsing updates the input, and committing the input re-points the browser, so there is a single unambiguous destination. A destination that names an existing file overwrites that file; one that doesn't exist yet is created at send time (the browser shows the nearest existing ancestor with a `[will be created]` note).
+3. Navigate to the file or folder in the local file browser (`j`/`k`, `Enter`, `r` to refresh).
+4. Click **Send** (or press `s`) to queue the transfer.
+
+`~`-relative and relative destination paths are allowed; `..` traversal is rejected.
 
 ### Fetching files (Fetch tab)
 
@@ -72,11 +78,12 @@ tailshare --version
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Navigate file browser |
+| `j` / `k` | Navigate the focused file browser (local, destination, or fetch) |
 | `Enter` | Select file / enter directory |
 | `x` / `Delete` | Remove the selected job from the transfer queue (cancels it if already transferring) |
-| `r` | Refresh current view |
-| `R` | Refresh remote file browser (Fetch tab) |
+| `r` | Refresh the focused browser |
+| `R` | Refresh both remote browsers (destination on Send, source on Fetch) |
+| `Esc` | Clear the remote/local path inputs (destination resets to `~`) |
 | `d` | Refresh device list |
 | `s` | Send selected files |
 | `f` | Fetch selected files |
