@@ -8,46 +8,69 @@ This module implements the terminal user interface with:
 """
 
 import os
+import threading
+from functools import partial
 from pathlib import Path
 from typing import Any
 
-from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
-from textual.widgets import (
-    Header,
-    Footer,
-    Label,
-    Button,
-    Select,
-    Static,
-    ProgressBar,
-    DataTable,
-    Input,
-    Checkbox,
-)
-from textual.binding import Binding
 from textual import events
-from textual.message import Message
-from textual.worker import Worker, WorkerState
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.events import Resize
+from textual.message import Message
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    Static,
+    TabbedContent,
+    TabPane,
+)
 
+from tailshare import __version__
+from tailshare.config import setup_logging
 from tailshare.devices import Device, DeviceDiscovery, TailscaleNotRunningError
-from tailshare.transfer import TransferManager, TransferTask, TransferError
-from tailshare.config import get_config, setup_logging, expand_path
+from tailshare.transfer import (
+    SFTPClient,
+    TransferDirection,
+    TransferError,
+    TransferManager,
+    TransferTask,
+)
+
+
+class FileSelected(Message):
+    """Message sent when a file is selected."""
+    def __init__(self, dir_path: str, file_path: str) -> None:
+        super().__init__()
+        self.dir_path = dir_path
+        self.file_path = file_path
+
+
+class RemoteFileSelected(Message):
+    """Message sent when a remote file is selected."""
+    def __init__(self, dir_path: str, file_path: str) -> None:
+        super().__init__()
+        self.dir_path = dir_path
+        self.file_path = file_path
 
 
 class FileBrowser(Vertical):
     """File browser widget for selecting files/folders to transfer."""
-    
+
     can_focus = True
-    
+
     BINDINGS = [
         Binding("j", "navigate_down", "Down", show=False),
         Binding("k", "navigate_up", "Up", show=False),
         Binding("Enter", "select", "Select", show=True),
         Binding("r", "refresh", "Refresh", show=False),
     ]
-    
+
     def __init__(
         self,
         *args: Any,
@@ -58,17 +81,17 @@ class FileBrowser(Vertical):
         self._path = path
         self._entries: list[tuple[str, bool]] = []  # (name, is_directory)
         self._name_column_key: Any = None
-    
+
     @property
     def path(self) -> str:
         """Current directory path."""
         return self._path
-    
+
     def compose(self) -> ComposeResult:
         """Compose the file browser layout."""
         yield Label(id="path-label")
         yield DataTable(id="file-table")
-    
+
     def on_mount(self) -> None:
         """Refresh file list when mounted."""
         self._refresh_entries()
@@ -88,57 +111,57 @@ class FileBrowser(Vertical):
                 column.width = max(available, 10)
                 column.auto_width = False
                 table.refresh()
-    
+
     def _refresh_entries(self) -> None:
         """Refresh the file/directory listing."""
         self._entries = []
-        
+
         try:
             path = Path(self._path)
-            
+
             if str(path) != "/":
                 # Add parent directory entry
                 self._entries.append(("..", True))
-            
+
             # Get directory contents
             entries = sorted(
                 path.iterdir(),
                 key=lambda e: (not e.is_dir(), e.name.lower()),
             )
-            
+
             for entry in entries:
                 self._entries.append((entry.name, entry.is_dir()))
-                
+
         except PermissionError:
             self._entries = [("<Permission Denied>", True)]
         except Exception:
             self._entries = [("<Invalid Path>", True)]
-            
+
         self._update_table()
-    
+
     def _update_table(self) -> None:
         """Update the DataTable with current entries."""
         table = self.query_one("#file-table", DataTable)
         table.clear()
-        
+
         if not table.columns:
             self._name_column_key = table.add_column("Name")
-        
-        for name, is_dir in self._entries:
+
+        for name, _ in self._entries:
             table.add_row(name, key=name)
-            
+
         self.query_one("#path-label", Label).update(f"[b]Path:[/b] {self._path}")
-    
+
     def navigate_down(self) -> None:
         """Navigate selection down."""
         table = self.query_one("#file-table", DataTable)
         table.action_cursor_down()
-    
+
     def navigate_up(self) -> None:
         """Navigate selection up."""
         table = self.query_one("#file-table", DataTable)
         table.action_cursor_up()
-    
+
     def action_select(self) -> None:
         """Select current entry via keyboard."""
         table = self.query_one("#file-table", DataTable)
@@ -152,18 +175,7 @@ class FileBrowser(Vertical):
         """Refresh file list."""
         self._refresh_entries()
         self.app.notify("Directory refreshed")
-    
-    class FileSelected(Message):
-        """Message sent when a file is selected."""
-        
-        def __init__(self, dir_path: str, file_path: str) -> None:
-            super().__init__()
-            self.dir_path = dir_path
-            self.file_path = file_path
-        
-        def __hash__(self) -> int:
-            return hash(self.file_path)
-    
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Handle row selection in the file table."""
         self._handle_selection(str(event.row_key.value))
@@ -180,7 +192,7 @@ class FileBrowser(Vertical):
             # Find entry index by name
             index = next(i for i, (n, _) in enumerate(self._entries) if n == name)
             _, is_dir = self._entries[index]
-            
+
             if name == "..":
                 # Go to parent directory
                 self._path = str(Path(self._path).parent)
@@ -192,7 +204,7 @@ class FileBrowser(Vertical):
             else:
                 # Select file - notify parent
                 self.post_message(
-                    self.FileSelected(self._path, str(Path(self._path) / name))
+                    FileSelected(self._path, str(Path(self._path) / name))
                 )
         except StopIteration:
             pass
@@ -202,86 +214,283 @@ class FileBrowser(Vertical):
         self.focus()
 
 
+class RemoteFileBrowser(Vertical):
+    """Remote file browser widget for selecting files/folders to fetch."""
 
-class TransferQueue(Static):
-    """Widget displaying transfer queue and progress."""
-    
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    can_focus = True
+
+    BINDINGS = [
+        Binding("j", "navigate_down", "Down", show=False),
+        Binding("k", "navigate_up", "Up", show=False),
+        Binding("Enter", "select", "Select", show=True),
+        Binding("r", "refresh", "Refresh", show=False),
+    ]
+
+    def __init__(
+        self,
+        *args: Any,
+        sftp_client: Any = None,
+        path: str = "~",
+        app: Any = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
+        self._sftp_client = sftp_client
+        self._path = path
+        self._entries: list[tuple[str, bool]] = []  # (name, is_directory)
+        self._name_column_key: Any = None
+        self._app = app
+        self._refresh_generation = 0
+
+    @property
+    def path(self) -> str:
+        """Current remote directory path."""
+        return self._path
+
+    def compose(self) -> ComposeResult:
+        """Compose the remote file browser layout."""
+        yield Label(id="remote-path-label")
+        yield DataTable(id="remote-file-table")
+
+    def on_mount(self) -> None:
+        """Refresh file list when mounted."""
+        self._refresh_entries()
+        self.call_after_refresh(self._set_column_width)
+
+    def on_resize(self, event: Resize) -> None:
+        """Handle resize to update column width."""
+        self._set_column_width()
+
+    def _set_column_width(self) -> None:
+        """Set the Name column width to fill the table."""
+        table = self.query_one("#remote-file-table", DataTable)
+        if table.columns and self._name_column_key:
+            column = table.columns.get(self._name_column_key)
+            if column:
+                available = table.container_size.width - 2 * table.cell_padding
+                column.width = max(available, 10)
+                column.auto_width = False
+                table.refresh()
+
+    def _refresh_entries(self) -> None:
+        """Refresh the remote listing without blocking the UI thread."""
+        # Get SFTP client - either from direct reference or app
+        sftp_client = self._sftp_client
+        if sftp_client is None and self._app is not None:
+            sftp_client = getattr(self._app, "_remote_sftp_client", None)
+
+        if sftp_client is None:
+            self._entries = [("<Not Connected>", False)]
+            self._update_table()
+            return
+
+        path = self._path
+
+        # Guard against stale results when refreshes overlap
+        self._refresh_generation += 1
+        generation = self._refresh_generation
+
+        def on_listed(entries: list[tuple[str, bool]]) -> None:
+            if generation == self._refresh_generation:
+                self._show_entries(path, entries)
+
+        def on_error(message: str) -> None:
+            if generation == self._refresh_generation:
+                self._show_entries(path, [(message, False)])
+
+        self.run_worker(
+            partial(self._list_remote_dir, sftp_client, path, on_listed, on_error),
+            thread=True,
+        )
+
+    def _list_remote_dir(
+        self,
+        sftp_client: Any,
+        path: str,
+        on_listed: Any,
+        on_error: Any,
+    ) -> None:
+        """List a remote directory in a background thread."""
+        try:
+            entries = sftp_client.list_remote_dir(path)
+        except TransferError as e:
+            self.call_later(on_error, str(e))
+            return
+        self.call_later(on_listed, entries)
+
+    def _show_entries(self, path: str, entries: list[tuple[str, bool]]) -> None:
+        """Apply a directory listing to the table (main thread)."""
+        self._entries = []
+
+        if path != "~" and path != ".":
+            # Add parent directory entry
+            self._entries.append(("..", True))
+
+        self._entries.extend(entries)
+        self._update_table()
+
+    def _update_table(self) -> None:
+        """Update the DataTable with current entries."""
+        table = self.query_one("#remote-file-table", DataTable)
+        table.clear()
+
+        if not table.columns:
+            self._name_column_key = table.add_column("Name")
+
+        for name, _ in self._entries:
+            table.add_row(name, key=name)
+
+        display_path = self._path if self._path != "." else "~"
+        self.query_one("#remote-path-label", Label).update(f"[b]Remote Path:[/b] {display_path}")
+
+    def navigate_down(self) -> None:
+        """Navigate selection down."""
+        table = self.query_one("#remote-file-table", DataTable)
+        table.action_cursor_down()
+
+    def navigate_up(self) -> None:
+        """Navigate selection up."""
+        table = self.query_one("#remote-file-table", DataTable)
+        table.action_cursor_up()
+
+    def action_select(self) -> None:
+        """Select current entry via keyboard."""
+        table = self.query_one("#remote-file-table", DataTable)
+        if table.cursor_row is not None:
+            row_index = table.cursor_row
+            if 0 <= row_index < len(self._entries):
+                name, _ = self._entries[row_index]
+                self._handle_selection(name)
+
+    def action_refresh(self) -> None:
+        """Refresh file list."""
+        self._refresh_entries()
+        self.app.notify("Directory refreshed")
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Handle row selection in the file table."""
+        self._handle_selection(str(event.row_key.value))
+        event.stop()
+
+    def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
+        """Handle cell selection in the file table."""
+        self._handle_selection(str(event.cell_key.row_key.value))
+        event.stop()
+
+    def _handle_selection(self, name: str) -> None:
+        """Process selection of a file or directory by name."""
+        try:
+            index = next(i for i, (n, _) in enumerate(self._entries) if n == name)
+            _, is_dir = self._entries[index]
+
+            if name == "..":
+                # Go to parent directory
+                current_path = self._path
+                if current_path == "." or current_path == "~":
+                    parent = "~"
+                else:
+                    parent = str(Path(current_path).parent)
+                self._path = parent if parent else "~"
+                self._refresh_entries()
+            elif is_dir:
+                # Enter directory
+                new_path = str(Path(self._path) / name) if self._path != "~" else name
+                self._path = new_path
+                self._refresh_entries()
+            else:
+                # Select file - notify parent
+                self.post_message(
+                    RemoteFileSelected(self._path, str(Path(self._path) / name))
+                )
+
+        except StopIteration:
+            pass
+
+    def on_click(self, event: events.Click) -> None:
+        """Handle click events to select entries."""
+        self.focus()
+
+
+class TransferQueue(Label):
+    """Widget displaying transfer queue and progress."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__("", *args, **kwargs)
         self._tasks: list[TransferTask] = []
-    
+
     def update_tasks(self, tasks: list[TransferTask]) -> None:
         """Update the displayed tasks.
-        
+
         Args:
             tasks: List of current transfer tasks
         """
         self._tasks = tasks
-        self.update(self.render())
-    
-    def render(self) -> str:
-        """Render the transfer queue."""
         if not self._tasks:
-            return "[dim]No pending transfers[/dim]"
-        
-        lines = ["[b]Transfer Queue:[/b]"]
-        lines.append("")
-        
-        for i, task in enumerate(self._tasks, 1):
-            status_icon = {
-                "pending": "[yellow]⏳[/yellow]",
-                "transferring": "[blue]⏳[/blue]",
-                "completed": "[green]✓[/green]",
-                "failed": "[red]✗[/red]",
-            }.get(task.status, "?")
-            
-            lines.append(
-                f"{status_icon} [{i}] {task.progress.filename}"
-            )
-            lines.append(
-                f"    → {task.device.name}:{task.target_path}"
-            )
-            
-            if task.status == "transferring":
-                pct = task.progress.percentage
+            self.update("[dim]No pending transfers[/dim]")
+        else:
+            lines = ["[b]Transfer Queue:[/b]", ""]
+
+            for i, task in enumerate(self._tasks, 1):
+                status_icon = {
+                    "pending": "[yellow]⏳[/yellow]",
+                    "transferring": "[blue]⏳[/blue]",
+                    "completed": "[green]✓[/green]",
+                    "failed": "[red]✗[/red]",
+                }.get(task.status, "?")
+
                 lines.append(
-                    f"    [cyan]{pct:.1f}%[/cyan] "
-                    f"({task.progress.transferred / 1024:.1f} KB)"
+                    f"{status_icon} [{i}] {task.progress.filename}"
                 )
-            
-            if task.error:
-                lines.append(f"    [red]{task.error}[/red]")
-            
-            lines.append("")
-        
-        return "\n".join(lines)
+                if task.direction == TransferDirection.FETCH:
+                    lines.append(
+                        f"    ← {task.device.name}:{task.source_path}"
+                    )
+                else:
+                    lines.append(
+                        f"    → {task.device.name}:{task.target_path}"
+                    )
+
+                if task.status == "transferring":
+                    pct = task.progress.percentage
+                    lines.append(
+                        f"    [cyan]{pct:.1f}%[/cyan] "
+                        f"({task.progress.transferred / 1024:.1f} KB)"
+                    )
+
+                if task.error:
+                    lines.append(f"    [red]{task.error}[/red]")
+
+                lines.append("")
+
+            self.update("\n".join(lines))
 
 
 class TailshareApp(App[None]):
     """Main application for tailshare file sharing.
-    
+
     Provides a TUI for discovering Tailscale devices and
     transferring files via SFTP.
     """
-    
+
     CSS = """
     Screen {
-        layout: grid;
-        grid-size: 1;
+        layout: vertical;
     }
-    
+
     #main-container {
         width: 100%;
         height: 1fr;
+        layout: grid;
+        grid-size: 2 1;
     }
-    
+
     #left-panel {
         width: 1fr;
         height: 1fr;
         border: solid $primary;
         margin: 1;
     }
-    
+
     #device-auth {
         margin: 0;
         height: auto;
@@ -292,14 +501,14 @@ class TailshareApp(App[None]):
         height: auto;
         align-horizontal: center;
     }
-    
-    #right-panel {
+
+    #transfer-tabs {
         width: 1fr;
         height: 1fr;
         border: solid $primary;
         margin: 1;
     }
-    
+
     #device-list {
         height: 1fr;
     }
@@ -309,7 +518,7 @@ class TailshareApp(App[None]):
         color: $text;
         text-style: bold;
     }
-    
+
     #file-browser-container {
         height: 2fr;
     }
@@ -317,48 +526,54 @@ class TailshareApp(App[None]):
     #file-table {
         height: 1fr;
     }
-    
+
     #path-spacer {
         height: 1;
     }
-    
+
     #transfer-queue-container {
         height: 4fr;
     }
-    
+
     #transfer-queue {
         height: auto;
     }
-    
-    .status-bar {
-        dock: bottom;
+
+    #remote-file-browser-container {
+        height: 2fr;
+    }
+
+    #remote-file-table {
+        height: 1fr;
+    }
+
+    #path-spacer-fetch {
         height: 1;
-        background: $primary-darken-2;
     }
-    
-    .error-message {
-        color: $error;
-        background: $error-darken-1;
+
+    #transfer-queue-container-fetch {
+        height: 4fr;
     }
-    
-    .success-message {
-        color: $success;
-        background: $success-darken-1;
+
+    #transfer-queue-fetch {
+        height: auto;
     }
     """
-    
+
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("d", "refresh_devices", "Refresh Devices"),
         Binding("s", "send", "Send"),
+        Binding("f", "fetch", "Fetch"),
         Binding("c", "clear_queue", "Clear Queue"),
         Binding("r", "refresh_files", "Refresh Files"),
+        Binding("R", "refresh_remote", "Refresh Remote"),
     ]
-    
+
     TITLE = "Tailshare"
-    VERSION = "v1.0"
+    VERSION = __version__
     SUB_TITLE = f"File Sharing over Tailscale ({VERSION})"
-    
+
     def __init__(self) -> None:
         super().__init__()
         self._device_discovery = DeviceDiscovery()
@@ -367,13 +582,17 @@ class TailshareApp(App[None]):
         self._selected_device: Device | None = None
         self._selected_device_name: str | None = None
         self._selected_path: str = ""
+        self._selected_remote_path: str = ""
         self._worker_running = False
+        self._worker_lock = threading.Lock()
         self._queue_update_enabled: bool = False
-    
+        self._interval_token: Any = None
+        self._remote_sftp_client: Any = None
+
     def compose(self) -> ComposeResult:
         """Compose the UI layout."""
         yield Header()
-        
+
         with Horizontal(id="main-container"):
             with Vertical(id="left-panel"):
                 yield Label("[b]Tailscale Devices[/b]", id="device-header")
@@ -391,85 +610,124 @@ class TailshareApp(App[None]):
                 with Horizontal(id="device-controls"):
                     yield Button("Refresh", id="btn-refresh-devices", variant="primary")
                     yield Button("Test", id="btn-test-device", variant="default")
-            
-            with Vertical(id="right-panel"):
-                yield Label("[b]File Browser[/b]", id="file-header")
-                with ScrollableContainer(id="file-browser-container"):
-                    yield FileBrowser(id="file-browser", path="/")
-                
-                yield Static(id="path-spacer")
-                
-                with Horizontal(id="transfer-controls"):
-                    yield Input(
-                        placeholder="Remote path (default: ~)",
-                        id="remote-path",
-                    )
-                    yield Button("Send", id="btn-send", variant="primary")
-                
-                with ScrollableContainer(id="transfer-queue-container"):
-                    yield TransferQueue(id="transfer-queue")
-                
-                yield Footer()
-    
+
+            with TabbedContent(id="transfer-tabs"):
+                with TabPane("Send", id="send-tab"), Vertical(id="right-panel"):
+                    yield Label("[b]File Browser[/b]", id="file-header")
+                    with ScrollableContainer(id="file-browser-container"):
+                        yield FileBrowser(id="file-browser", path="/")
+
+                    yield Static(id="path-spacer")
+
+                    with Horizontal(id="transfer-controls"):
+                        yield Input(
+                            placeholder="Remote path (default: ~)",
+                            id="remote-path",
+                        )
+                        yield Button("Send", id="btn-send", variant="primary")
+
+                    with ScrollableContainer(id="transfer-queue-container"):
+                        yield Label("", id="send-status-chip")
+                        yield TransferQueue(id="transfer-queue")
+
+                with TabPane("Fetch", id="fetch-tab"), Vertical(id="right-panel-fetch"):
+                        yield Label("[b]Remote File Browser[/b]", id="remote-file-header")
+                        with ScrollableContainer(id="remote-file-browser-container"):
+                            yield RemoteFileBrowser(id="remote-file-browser", path="~", app=self)
+
+                        yield Static(id="path-spacer-fetch")
+
+                        with Horizontal(id="fetch-controls"):
+                            yield Input(
+                                placeholder="Local path (default: ~)",
+                                id="local-path",
+                            )
+                            yield Button("Fetch", id="btn-fetch", variant="primary")
+
+                        with ScrollableContainer(id="transfer-queue-container-fetch"):
+                            yield Label("", id="fetch-status-chip")
+                            yield TransferQueue(id="transfer-queue-fetch")
+
+        yield Footer()
+
     def on_mount(self) -> None:
         """Initialize app when mounted."""
         setup_logging()
         device_list = self.query_one("#device-list", DataTable)
         device_list.add_columns("Name", "IP", "Status")
         self._refresh_device_list()
-    
+
+    def on_unmount(self) -> None:
+        """Release the persistent SFTP client when the app exits."""
+        if self._remote_sftp_client is not None:
+            self._remote_sftp_client.disconnect()
+            self._remote_sftp_client = None
+
     def on_key(self, event: events.Key) -> None:
         """Handle key events."""
         if event.key == "escape":
             self.query_one("#remote-path", Input).value = ""
-    
+            self.query_one("#local-path", Input).value = ""
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle button presses."""
         button_id = event.button.id
-        
+
         if button_id == "btn-refresh-devices":
             self._refresh_device_list()
+            self._connect_for_remote_browser()
         elif button_id == "btn-test-device":
             self._test_selected_device()
         elif button_id == "btn-send":
             self._send_files()
-        elif button_id == "btn-clear":
-            self._transfer_manager.clear_completed()
-            self._update_queue_display()
-    
+        elif button_id == "btn-fetch":
+            self._fetch_files()
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Handle device selection via row selection."""
         if event.data_table.id == "device-list":
-            device_name = str(event.row_key.value)
-            self._select_device_by_name(device_name)
+            self._select_device_by_key(str(event.row_key.value))
 
     def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
         """Handle device selection via cell click."""
         if event.data_table.id == "device-list":
-            device_name = str(event.cell_key.row_key.value)
-            self._select_device_by_name(device_name)
+            self._select_device_by_key(str(event.cell_key.row_key.value))
 
-    def _select_device_by_name(self, name: str) -> None:
-        """Helper to select a device and notify the user."""
-        device = self._device_discovery.get_device_by_name(name)
+    def _select_device_by_key(self, key: str) -> None:
+        """Select the device identified by its row key (machine id or IP)."""
+        device = next(
+            (
+                d
+                for d in self._device_discovery.get_devices()
+                if (d.machine_id or d.ip) == key
+            ),
+            None,
+        )
         if device:
-            self._selected_device = device
-            self._selected_device_name = name
-            self._refresh_device_list()
-            
-            self.notify(
-                f"Selected {device.name}",
-                title="Device Selected",
-            )
+            self._select_device(device)
         else:
             self.notify(
-                f"Could not find device: {name}",
+                f"Could not find device: {key}",
                 title="Error",
                 severity="error",
             )
-    
-    def on_file_browser_file_selected(self, event: FileBrowser.FileSelected) -> None:
-        """Handle file selection from browser."""
+
+    def _select_device(self, device: Device) -> None:
+        """Select a device and populate the remote browser."""
+        self._selected_device = device
+        self._selected_device_name = device.name
+        self._refresh_device_list()
+
+        # Try to connect to populate remote browser
+        self._connect_for_remote_browser()
+
+        self.notify(
+            f"Selected {device.name}",
+            title="Device Selected",
+        )
+
+    def on_file_selected(self, event: FileSelected) -> None:
+        """Handle file selection from browser (Send tab)."""
         self._selected_path = event.file_path
         if self._selected_device:
             self._send_files()
@@ -478,106 +736,159 @@ class TailshareApp(App[None]):
                 f"Selected: {event.file_path}. Please select a target device to queue.",
                 title="File Selected",
             )
-    
+
+    def on_remote_file_selected(self, event: RemoteFileSelected) -> None:
+        """Handle file selection from remote browser (Fetch tab)."""
+        self._selected_remote_path = event.file_path
+        if self._selected_device:
+            self._fetch_files()
+        else:
+            self.notify(
+                f"Selected: {event.file_path}. Please select a target device to queue.",
+                title="File Selected",
+            )
+
     def action_refresh_devices(self) -> None:
         """Refresh device list."""
         self._refresh_device_list()
-    
+
     def action_refresh_files(self) -> None:
         """Refresh file browser."""
         browser = self.query_one("#file-browser", FileBrowser)
         browser.action_refresh()
-    
+
     def action_send(self) -> None:
         """Send selected files."""
         self._send_files()
-    
+
+    def action_fetch(self) -> None:
+        """Fetch selected files from remote device."""
+        self._fetch_files()
+
+    def action_refresh_remote(self) -> None:
+        """Refresh remote file browser."""
+        browser = self.query_one("#remote-file-browser", RemoteFileBrowser)
+        browser.action_refresh()
+
     def action_clear_queue(self) -> None:
         """Clear completed transfers."""
         self._transfer_manager.clear_completed()
         self._update_queue_display()
-    
+
     def action_quit(self) -> None:
         """Quit the application."""
         self.exit()
-    
+
     def _refresh_device_list(self) -> None:
         """Refresh the list of Tailscale devices."""
-        device_list = self.query_one("#device-list", DataTable)
-        device_list.clear()
-        
+        self.run_worker(self._discover_devices, thread=True)
+
+    def _discover_devices(self) -> None:
+        """Discover devices in a background thread.
+
+        Performs no DOM access; the table update is scheduled on the
+        main thread via call_later.
+        """
+        rows: list[tuple] = []
+
         try:
             devices = self._device_discovery.discover()
-            
+
+            rows = []
             for device in devices:
                 status = "Online" if device.online else "Offline"
-                
-                # Apply highlight if this is the selected recipient
                 style_prefix = ""
                 style_suffix = ""
                 if self._selected_device_name == device.name:
                     style_prefix = "[background=$primary][color=$text][b]"
                     style_suffix = "[/]"
-                
-                device_list.add_row(
-                    f"{style_prefix}{device.name}{style_suffix}",
-                    f"{style_prefix}{device.ip}{style_suffix}",
-                    f"{style_prefix}{status}{style_suffix}",
-                    key=device.name,
+                # Row key must be unique per device: use the machine id
+                # (falling back to IP) so name collisions cannot crash
+                # the table with a DuplicateKey error.
+                rows.append(
+                    (
+                        f"{style_prefix}{device.name}{style_suffix}",
+                        f"{style_prefix}{device.ip}{style_suffix}",
+                        f"{style_prefix}{status}{style_suffix}",
+                        device.machine_id or device.ip,
+                    )
                 )
-            
+
             if not devices:
-                self.notify(
-                    "No Tailscale devices found",
-                    title="Warning",
-                    severity="warning",
+                self.call_later(
+                    lambda: self.notify(
+                        "No Tailscale devices found",
+                        title="Warning",
+                        severity="warning",
+                    )
                 )
-            
+
         except TailscaleNotRunningError as e:
-            self.notify(
-                str(e),
-                title="Tailscale Not Running",
-                severity="error",
+            # Capture the message before scheduling: the except variable is
+            # deleted when the block exits, but the lambda runs later.
+            msg = str(e)
+            self.call_later(
+                lambda: self.notify(
+                    msg,
+                    title="Tailscale Not Running",
+                    severity="error",
+                )
             )
-            device_list.add_row(
-                "[Tailscale Not Running]",
-                "-",
-                "Error",
-            )
+            rows = [("[Tailscale Not Running]", "-", "Error", "error")]
         except Exception as e:
-            self.notify(
-                f"Device discovery failed: {e}",
-                title="Error",
-                severity="error",
+            msg = f"Device discovery failed: {e}"
+            self.call_later(
+                lambda: self.notify(
+                    msg,
+                    title="Error",
+                    severity="error",
+                )
             )
-    
+            rows = [("[Discovery Failed]", "-", "Error", "error")]
+
+        # Populate table on the main thread
+        self.call_later(self._populate_device_table, rows)
+
+    def _populate_device_table(self, rows: list[tuple]) -> None:
+        """Clear and populate the device list (must run on main thread)."""
+        device_list = self.query_one("#device-list", DataTable)
+        device_list.clear()
+        for row in rows:
+            device_list.add_row(row[0], row[1], row[2], key=row[3])
+
     def _test_selected_device(self) -> None:
-        """Test connection to selected device."""
+        """Test connection to the selected device (off the UI thread)."""
         if not self._selected_device:
             self.notify("No device selected", title="Warning", severity="warning")
             return
-        
+
+        device = self._selected_device
         user = self.query_one("#remote-user", Input).value.strip() or None
         password = self.query_one("#remote-password", Input).value.strip() or None
 
+        self.run_worker(
+            partial(self._test_connection_in_thread, device, user, password),
+            thread=True,
+        )
+
+    def _test_connection_in_thread(
+        self, device: Device, user: str | None, password: str | None
+    ) -> None:
+        """Run a blocking connection test in a background thread."""
         success, message = self._transfer_manager.test_device_connection(
-            self._selected_device,
+            device,
             username=user,
             password=password,
         )
-        
         if success:
-            self.notify(
-                f"Connection to {self._selected_device.name} successful",
-                title="Connection Test",
-            )
+            msg = f"Connection to {device.name} successful"
+            self.call_later(lambda: self.notify(msg, title="Connection Test"))
         else:
-            self.notify(
-                f"Connection failed: {message}",
-                title="Connection Test",
-                severity="error",
+            msg = f"Connection failed: {message}"
+            self.call_later(
+                lambda: self.notify(msg, title="Connection Test", severity="error")
             )
-    
+
     def _send_files(self) -> None:
         """Queue files for transfer."""
         if not self._selected_device:
@@ -587,7 +898,7 @@ class TailshareApp(App[None]):
                 severity="warning",
             )
             return
-        
+
         if not self._selected_path:
             self.notify(
                 "Please select files to transfer",
@@ -595,7 +906,7 @@ class TailshareApp(App[None]):
                 severity="warning",
             )
             return
-        
+
         if not os.path.exists(self._selected_path):
             self.notify(
                 f"Path not found: {self._selected_path}",
@@ -603,79 +914,246 @@ class TailshareApp(App[None]):
                 severity="error",
             )
             return
-        
+
         # Get credentials and remote path
         user = self.query_one("#remote-user", Input).value.strip() or None
         password = self.query_one("#remote-password", Input).value.strip() or None
-        
+
         remote_path_input = self.query_one("#remote-path", Input)
         remote_path = remote_path_input.value.strip()
         if not remote_path:
             remote_path = "~"
-        
+
         # Queue the transfer
         try:
-            is_folder = os.path.isdir(self._selected_path)
             task = self._transfer_manager.queue_transfer(
                 self._selected_path,
                 remote_path,
                 self._selected_device,
-                is_folder,
                 username=user,
                 password=password,
             )
-            
+
             self.notify(
                 f"Queued: {task.progress.filename}",
                 title="Transfer Queued",
             )
-            
+
             self._update_queue_display()
-            
+
             # Start transfer worker if not already running
-            if not self._worker_running:
-                self._worker_running = True
-                self.run_worker(
-                    self._execute_transfers,
-                    thread=True,
-                )
-                self._queue_update_enabled = True
-                self.set_interval(0.5, self._update_queue_display)
-            
+            self._start_transfer_worker()
+
         except TransferError as e:
             self.notify(
                 str(e),
                 title="Transfer Error",
                 severity="error",
             )
-    
+
+    def _start_transfer_worker(self) -> None:
+        """Start the transfer worker if not already running."""
+        with self._worker_lock:
+            if self._worker_running:
+                return
+            self._worker_running = True
+            self.run_worker(
+                self._execute_transfers,
+                thread=True,
+            )
+            self._queue_update_enabled = True
+            self._interval_token = self.set_interval(
+                0.5, self._update_queue_display
+            )
+
+    def _fetch_files(self) -> None:
+        """Queue files for fetching."""
+        if not self._selected_device:
+            self.notify(
+                "Please select a target device",
+                title="Warning",
+                severity="warning",
+            )
+            return
+
+        if not self._selected_remote_path:
+            self.notify(
+                "Please select files to fetch",
+                title="Warning",
+                severity="warning",
+            )
+            return
+
+        # Get credentials and local path
+        user = self.query_one("#remote-user", Input).value.strip() or None
+        password = self.query_one("#remote-password", Input).value.strip() or None
+
+        local_path_input = self.query_one("#local-path", Input)
+        local_path = local_path_input.value.strip()
+        if not local_path:
+            local_path = "~"
+
+        # Queue the fetch
+        try:
+            task = self._transfer_manager.queue_transfer(
+                self._selected_remote_path,
+                local_path,
+                self._selected_device,
+                username=user,
+                password=password,
+                direction=TransferDirection.FETCH,
+            )
+
+            self.notify(
+                f"Queued: {task.progress.filename}",
+                title="Fetch Queued",
+            )
+
+            self._update_queue_display()
+
+            # Start transfer worker if not already running
+            self._start_transfer_worker()
+
+        except TransferError as e:
+            self.notify(
+                str(e),
+                title="Fetch Error",
+                severity="error",
+            )
+
+    def _connect_for_remote_browser(self) -> None:
+        """Start connecting to the selected device for the remote browser."""
+        if not self._selected_device:
+            return
+
+        device = self._selected_device
+        user = self.query_one("#remote-user", Input).value.strip() or None
+        password = self.query_one("#remote-password", Input).value.strip() or None
+
+        # The SSH connection is blocking; run it off the UI thread.
+        self.run_worker(
+            partial(self._connect_in_thread, device, user, password),
+            thread=True,
+        )
+
+    def _connect_in_thread(
+        self, device: Device, user: str | None, password: str | None
+    ) -> None:
+        """Connect in a background thread and hand the client back."""
+        client = SFTPClient(device)
+        try:
+            client.connect(username=user, password=password)
+        except TransferError as e:
+            msg = f"Cannot connect to {device.name}: {e}"
+            self.call_later(
+                lambda: self.notify(
+                    msg, title="Connection Failed", severity="error"
+                )
+            )
+            return
+        self.call_later(self._adopt_remote_client, client)
+
+    def _adopt_remote_client(self, client: SFTPClient) -> None:
+        """Install a connected client, releasing the previous one (main thread)."""
+        if (
+            self._selected_device is None
+            or client.device.ip != self._selected_device.ip
+        ):
+            # The selection changed while the connection was in flight.
+            client.disconnect()
+            return
+
+        if (
+            self._remote_sftp_client is not None
+            and self._remote_sftp_client is not client
+        ):
+            self._remote_sftp_client.disconnect()
+
+        self._remote_sftp_client = client
+        remote_browser = self.query_one("#remote-file-browser", RemoteFileBrowser)
+        remote_browser._sftp_client = client
+        remote_browser._refresh_entries()
+
     def _execute_transfers(self) -> None:
-        """Execute queued transfers in background.
-        
-        Loops until the queue is empty, picking up any tasks
-        queued during execution.
+        """Execute queued transfers in background (runs in worker thread).
+
+        execute_queue() itself loops until the queue is empty, picking
+        up tasks queued while it runs.
         """
-        while True:
+        try:
             self._transfer_manager.execute_queue()
-            if not self._transfer_manager.get_pending_tasks():
-                break
-        self._worker_running = False
-        self._queue_update_enabled = False
-    
+        finally:
+            self.call_later(self._on_worker_finished)
+
+    def _on_worker_finished(self) -> None:
+        """Clean up after the transfer worker finishes (runs on main thread)."""
+        with self._worker_lock:
+            self._worker_running = False
+            self._queue_update_enabled = False
+        if self._interval_token is not None:
+            self._interval_token.stop()
+            self._interval_token = None
+
+        # Refresh the display one last time, then restart the worker if
+        # a task slipped into the queue while it was winding down.
+        self._update_queue_display()
+        if self._transfer_manager.get_pending_tasks():
+            self._start_transfer_worker()
+
     def _on_transfer_progress(self, task: TransferTask) -> None:
         """Update queue display when transfer progress changes.
-        
+
         Args:
             task: Task with updated progress
         """
         self.call_later(self._update_queue_display)
-    
+
+    @staticmethod
+    def _format_status_chip(tasks: list[TransferTask]) -> str:
+        """Format a per-tab status chip from its task list."""
+        if not tasks:
+            return "[dim]Idle[/dim]"
+        active = sum(1 for t in tasks if t.status in ("pending", "transferring"))
+        done = sum(1 for t in tasks if t.status == "completed")
+        failed = sum(1 for t in tasks if t.status == "failed")
+        parts: list[str] = []
+        if active:
+            parts.append(f"[blue]⏳ {active} active[/blue]")
+        if done:
+            parts.append(f"[green]✓ {done} done[/green]")
+        if failed:
+            parts.append(f"[red]✗ {failed} failed[/red]")
+        return "  ".join(parts)
+
     def _update_queue_display(self) -> None:
-        """Update the transfer queue display."""
+        """Update the transfer queue display and per-tab status chips."""
+        all_tasks = self._transfer_manager.get_all_tasks()
+        send_tasks = [
+            t for t in all_tasks if t.direction is TransferDirection.SEND
+        ]
+        fetch_tasks = [
+            t for t in all_tasks if t.direction is TransferDirection.FETCH
+        ]
+
+        # Status chips update regardless of worker state
+        self.query_one("#send-status-chip", Label).update(
+            self._format_status_chip(send_tasks)
+        )
+        self.query_one("#fetch-status-chip", Label).update(
+            self._format_status_chip(fetch_tasks)
+        )
+
         if not self._queue_update_enabled:
             return
-        queue_widget = self.query_one("#transfer-queue", TransferQueue)
-        tasks = self._transfer_manager.get_all_tasks()
+
+        # Update the current tab's queue (each tab shows its own direction)
+        current_tab = self.query_one("#transfer-tabs", TabbedContent).active_pane
+        if current_tab.id == "send-tab":
+            queue_widget = self.query_one("#transfer-queue", TransferQueue)
+            tasks = send_tasks
+        else:
+            queue_widget = self.query_one("#transfer-queue-fetch", TransferQueue)
+            tasks = fetch_tasks
         queue_widget.update_tasks(tasks)
 
 
