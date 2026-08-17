@@ -59,7 +59,7 @@ tailshare --version
 
 1. Pick a device first — the **Destination** browser (right-hand panel) connects automatically and lists the remote home directory. It sits side-by-side with the local file browser so you can see both ends at once.
 2. Choose where to send:
-   - **Browse** the Destination panel — click a folder to enter it, `..` to go up (from home, to the parent of home such as `/home`, and all the way to `/` on remotes that are not chroot-jailed). Entering a folder sets it as the destination.
+   - **Browse** the Destination panel — click a folder to enter it, `..` to go up (from home, to the parent of home such as `/home`, and all the way to `/`). On a chroot-jailed remote (or `HOME=/`) home *is* the root of its filesystem: the listing is marked `[home is root]` and selecting `..` explains that there is nothing above it. Entering a folder sets it as the destination.
    - **Type** a path into the **Remote path** input at the bottom (commit with `Enter` or by clicking away). Trailing slashes are normalized, so `/mnt/hdd/` and `/mnt/hdd` are the same destination.
    - The two are always in sync: browsing updates the input, and committing the input re-points the browser, so there is a single unambiguous destination. A destination that names an existing file overwrites that file; one that doesn't exist yet is created at send time (the browser shows the nearest existing ancestor with a `[will be created]` note); one the remote will not let you access is flagged `[not accessible]` (permission denied or a jailed SFTP namespace).
 3. Navigate to the file or folder in the local file browser (`j`/`k`, `Enter`, `r` to refresh).
@@ -69,7 +69,7 @@ tailshare --version
 
 ### Fetching files (Fetch tab)
 
-1. Pick a device first — the remote file browser connects automatically and lists the remote home directory (click `..` to go up — including above home, all the way to `/` on remotes that are not chroot-jailed — `r` to refresh).
+1. Pick a device first — the remote file browser connects automatically and lists the remote home directory (click `..` to go up — including above home, all the way to `/`; on a chroot-jailed remote there is nothing above home and `..` says so — `r` to refresh).
 2. Select a file or directory in the remote browser.
 3. Enter the local destination path (default `~`).
 4. Click **Fetch** (or press `f`) to queue the download.

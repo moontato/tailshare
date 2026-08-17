@@ -142,6 +142,13 @@ class FakeSFTP:
             raise FileNotFoundError(f"No such file: {path}")
         del self.tree[norm]
 
+    def normalize(self, path: str) -> str:
+        # paramiko's REALPATH: server-side absolute resolution.
+        norm = self._norm(path)
+        if norm not in self.tree:
+            raise FileNotFoundError(f"No such file: {path}")
+        return norm
+
     def close(self) -> None:
         self.closed = True
 
@@ -293,6 +300,29 @@ class TestSFTPPathHandling:
         assert client.is_remote_dir("/etc") is True
         assert client.is_remote_dir("/etc/passwd") is False
         assert client.is_remote_dir("/missing") is None
+
+    def test_canonicalize_uses_server_realpath(self, client, fake_sftp) -> None:
+        fake_sftp.add_dir("/home/u")
+        fake_sftp.cwd = "/home/u"
+        assert client.canonicalize("~") == "/home/u"
+        assert client.canonicalize("/home") == "/home"
+
+    def test_canonicalize_returns_none_when_not_connected(
+        self, fake_sftp
+    ) -> None:
+        device = Device(
+            name="test-pc",
+            hostname="test-pc",
+            ip="100.64.0.1",
+            online=True,
+            last_seen=None,
+            machine_id="m1",
+        )
+        not_connected = SFTPClient(device)
+        assert not_connected.canonicalize("~") is None
+
+    def test_canonicalize_returns_none_on_error(self, client, fake_sftp) -> None:
+        assert client.canonicalize("/nope") is None
 
     def test_is_remote_dir_tilde_maps_to_cwd(self, client, fake_sftp) -> None:
         fake_sftp.add_dir("/home/u")

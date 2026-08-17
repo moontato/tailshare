@@ -645,8 +645,8 @@ class TestDestinationBrowserTUI:
             await pilot.press("q")
             await pilot.pause()
 
-    async def test_jailed_home_offers_no_dotdot(self, monkeypatch) -> None:
-        """On a jailed remote the home listing offers no '..' (no parent)."""
+    async def test_jailed_home_dotdot_explains(self, monkeypatch) -> None:
+        """Jailed remote: home is the namespace root; '..' explains it."""
 
         class JailedFS(FakeRemoteFS):
             def canonicalize(self, path: str) -> str | None:
@@ -670,10 +670,65 @@ class TestDestinationBrowserTUI:
             assert await _wait_until(
                 pilot, lambda: app._remote_sftp_client is not None
             )
+            browser = app.query_one(
+                "#remote-destination", RemoteDestinationBrowser
+            )
             table = app.query_one("#destination-file-table", DataTable)
+
             assert await _wait_until(
                 pilot,
-                lambda: _rows(table) == ["docs", "incoming", "report.txt"],
+                lambda: _rows(table) == ["..", "docs", "incoming", "report.txt"],
+            )
+            label = str(app.query_one("#destination-path-label", Label).render())
+            assert "[home is root]" in label
+
+            # Selecting '..' explains instead of navigating
+            table.post_message(DataTable.RowSelected(table, 0, RowKey("..")))
+            await pilot.pause()
+            assert browser.destination == "~"
+            assert any(
+                "No folder above home" in n.message for n in app._notifications
+            )
+
+            await pilot.press("q")
+            await pilot.pause()
+
+    async def test_home_dotdot_unresolvable_explains(self, monkeypatch) -> None:
+        """Server that cannot resolve home: '..' explains, stays put."""
+
+        class UnresolvableFS(FakeRemoteFS):
+            def canonicalize(self, path: str) -> str | None:
+                return None
+
+        app = TailshareApp()
+        async with app.run_test(size=(120, 35)) as pilot:
+            device = make_device()
+            fake = UnresolvableFS(device)
+            monkeypatch.setattr(tui_mod, "SFTPClient", lambda d: fake)
+            monkeypatch.setattr(app._device_discovery, "discover", lambda: [device])
+            monkeypatch.setattr(
+                app._device_discovery, "get_devices", lambda: [device]
+            )
+
+            app._select_device_by_key("m-dest")
+            assert await _wait_until(
+                pilot, lambda: app._remote_sftp_client is not None
+            )
+            browser = app.query_one(
+                "#remote-destination", RemoteDestinationBrowser
+            )
+            table = app.query_one("#destination-file-table", DataTable)
+
+            assert await _wait_until(
+                pilot,
+                lambda: _rows(table) == ["..", "docs", "incoming", "report.txt"],
+            )
+            table.post_message(DataTable.RowSelected(table, 0, RowKey("..")))
+            await pilot.pause()
+            assert browser.destination == "~"
+            assert any(
+                "Could not determine the folder above home" in n.message
+                for n in app._notifications
             )
 
             await pilot.press("q")

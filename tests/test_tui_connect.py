@@ -115,7 +115,7 @@ class TestRemoteConnection:
                 remote_table.get_cell_at((i, 0))
                 for i in range(remote_table.row_count)
             ]
-            assert rows == ["docs", "file.txt"]
+            assert rows == ["..", "docs", "file.txt"]
 
             await pilot.press("q")
             await pilot.pause()

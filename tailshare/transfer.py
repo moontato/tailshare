@@ -331,6 +331,10 @@ class SFTPClient:
     def canonicalize(self, path: str) -> str | None:
         """Resolve a remote path to its canonical absolute form.
 
+        Uses the server's REALPATH (paramiko's SFTPClient.normalize);
+        '.' resolves to the session's home directory, which on a
+        chroot-jailed SFTP account is the jail root '/'.
+
         Best effort: returns None when not connected or the server
         cannot resolve the path, so callers can degrade gracefully.
 
@@ -349,7 +353,7 @@ class SFTPClient:
             path = path.replace("~", ".", 1)
 
         try:
-            return self._sftp_client.canonicalize(path)
+            return self._sftp_client.normalize(path)
         except Exception:
             return None
 
