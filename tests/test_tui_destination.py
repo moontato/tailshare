@@ -19,16 +19,35 @@ from tailshare.tui import RemoteDestinationBrowser, TailshareApp
 
 
 class FakeRemoteFS:
-    """In-memory remote tree (home-relative, '~' root) mimicking SFTPClient."""
+    """In-memory remote tree (absolute, '/' root) mimicking SFTPClient.
 
+    The tree lives in absolute form and '~' paths resolve against the
+    home directory, mirroring a real (non-jailed) SFTP session. Paths
+    in DENIED exist but refuse stat/list with permission denied, like
+    a directory the user may not access.
+    """
+
+    HOME = "/home/user"
     DIRS = {
-        "~",
-        "~/docs",
-        "~/incoming",
-        "~/incoming/2025",
-        "~/incoming/2026",
+        "/",
+        "/home",
+        "/home/user",
+        "/home/user/docs",
+        "/home/user/incoming",
+        "/home/user/incoming/2025",
+        "/home/user/incoming/2026",
+        "/mnt",
+        "/mnt/hdd",
+        "/mnt/hdd/data",
+        "/mnt/secret",
     }
-    FILES = {"~/report.txt", "~/docs/notes.md", "~/incoming/2025/old.pdf"}
+    FILES = {
+        "/home/user/report.txt",
+        "/home/user/docs/notes.md",
+        "/home/user/incoming/2025/old.pdf",
+        "/mnt/hdd/data/vacation.iso",
+    }
+    DENIED = {"/mnt/secret", "/mnt/secret/hidden.txt"}
 
     def __init__(self, device: Device) -> None:
         self.device = device
@@ -40,35 +59,56 @@ class FakeRemoteFS:
     def disconnect(self) -> None:
         self.disconnected = True
 
-    @staticmethod
-    def _normalize(path: str) -> str:
+    def _normalize(self, path: str) -> str:
+        """Resolve '~' and relative paths against the home directory."""
         if path in ("", ".", "~"):
-            return "~"
+            return self.HOME
         if path.startswith("~"):
-            return path
+            rest = path[1:]
+            if not rest or rest.startswith("/"):
+                return self.HOME + rest
+            return self.HOME + "/" + rest
         if path.startswith("/"):
             return path
-        return f"~/{path}"
+        return self.HOME + "/" + path
+
+    def probe_remote(self, path: str) -> str:
+        if self.disconnected:
+            return "unavailable"
+        p = self._normalize(path)
+        if p in self.DENIED:
+            return "denied"
+        if p in self.DIRS:
+            return "dir"
+        if p in self.FILES:
+            return "file"
+        return "missing"
 
     def is_remote_dir(self, path: str) -> bool | None:
-        p = self._normalize(path)
-        if p in self.DIRS:
+        state = self.probe_remote(path)
+        if state == "dir":
             return True
-        if p in self.FILES:
+        if state == "file":
             return False
         return None
 
     def list_remote_dir(self, path: str) -> list[tuple[str, bool]]:
+        if self.disconnected:
+            raise TransferError("Not connected. Call connect() first.")
         p = self._normalize(path)
+        if p in self.DENIED:
+            raise TransferError(f"Cannot list directory {path}: permission denied")
         if p not in self.DIRS:
             raise TransferError(f"Cannot list directory {path}: no such directory")
+        base = p.rstrip("/")
+        prefix = base + "/"
         entries: dict[str, bool] = {}
         for other in sorted(self.DIRS | self.FILES):
-            if other == p or not other.startswith(p + "/"):
+            if other == p or not other.startswith(prefix):
                 continue
-            name = other[len(p) + 1 :].split("/", 1)[0]
+            name = other[len(prefix) :].split("/", 1)[0]
             if name not in entries:
-                entries[name] = f"{p}/{name}" in self.DIRS
+                entries[name] = f"{prefix}{name}" in self.DIRS
         return sorted(entries.items(), key=lambda e: (not e[1], e[0]))
 
 
@@ -124,18 +164,35 @@ class TestDestinationBrowserUnit:
     @pytest.mark.parametrize(
         ("path", "expected"),
         [
-            ("~", None),
+            ("~", "/"),
             ("~/a", "~"),
             ("~/a/b", "~/a"),
             ("a", "~"),
             ("a/b", "a"),
             ("/abs", "/"),
             ("/abs/a", "/abs"),
-            ("/", "/"),
+            ("/", None),
+            ("", "/"),
         ],
     )
     def test_parent_remote(self, path, expected) -> None:
         assert RemoteDestinationBrowser._parent_remote(path) == expected
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("  ~  ", "~"),
+            ("", "~"),
+            ("docs/", "docs"),
+            ("~/a/", "~/a"),
+            ("/", "/"),
+            ("/mnt/", "/mnt"),
+            ("/mnt/hdd/", "/mnt/hdd"),
+            ("/mnt/hdd//", "/mnt/hdd"),
+        ],
+    )
+    def test_normalize_destination(self, raw, expected) -> None:
+        assert RemoteDestinationBrowser._normalize_destination(raw) == expected
 
     @pytest.mark.parametrize(
         ("path", "name", "expected"),
@@ -145,6 +202,7 @@ class TestDestinationBrowserUnit:
             ("~/a", "b", "~/a/b"),
             ("docs", "x", "docs/x"),
             ("/abs", "b", "/abs/b"),
+            ("/", "b", "/b"),
         ],
     )
     def test_join(self, path, name, expected) -> None:
@@ -184,6 +242,51 @@ class TestDestinationBrowserUnit:
         assert path == "docs"
         assert entries == [("notes.md", False)]
         assert note == ""
+
+    def test_find_listing_absolute_dir_normalized(self) -> None:
+        fake = FakeRemoteFS(make_device())
+        path, entries, note = RemoteDestinationBrowser._find_listing(fake, "/mnt/hdd/")
+        assert path == "/mnt/hdd"
+        assert entries == [("data", True)]
+        assert note == ""
+
+    def test_find_listing_root(self) -> None:
+        fake = FakeRemoteFS(make_device())
+        path, entries, note = RemoteDestinationBrowser._find_listing(fake, "/")
+        assert path == "/"
+        assert entries == [("home", True), ("mnt", True)]
+        assert note == ""
+
+    def test_find_listing_missing_absolute_walks_to_ancestor(self) -> None:
+        fake = FakeRemoteFS(make_device())
+        path, entries, note = RemoteDestinationBrowser._find_listing(
+            fake, "/mnt/hdd/data/newdir/file.txt"
+        )
+        assert path == "/mnt/hdd/data"
+        assert entries == [("vacation.iso", False)]
+        assert note == "  [will be created]"
+
+    def test_find_listing_denied_destination_flagged(self) -> None:
+        fake = FakeRemoteFS(make_device())
+        path, entries, note = RemoteDestinationBrowser._find_listing(fake, "/mnt/secret")
+        assert path == "/mnt"
+        assert entries == [("hdd", True), ("secret", True)]
+        assert note == "  [not accessible]"
+
+    def test_find_listing_no_accessible_ancestor(self) -> None:
+        class EverythingDenied:
+            def probe_remote(self, path: str) -> str:
+                return "denied"
+
+            def list_remote_dir(self, path: str) -> list[tuple[str, bool]]:
+                raise TransferError("permission denied")
+
+        path, entries, note = RemoteDestinationBrowser._find_listing(
+            EverythingDenied(), "/mnt/hdd"
+        )
+        assert path == "/"
+        assert entries == []
+        assert note == "  [not accessible]"
 
 
 class TestDestinationBrowserTUI:
@@ -228,7 +331,7 @@ class TestDestinationBrowserTUI:
                 lambda: _rows(
                     browser.query_one("#destination-file-table", DataTable)
                 )
-                == ["docs", "incoming", "report.txt"],
+                == ["..", "docs", "incoming", "report.txt"],
             )
             label = str(
                 app.query_one("#destination-path-label", Label).render()
@@ -304,7 +407,7 @@ class TestDestinationBrowserTUI:
             # The destination stays the exact file; the listing is its parent
             assert browser.destination == "~/report.txt"
             assert app._remote_destination == "~/report.txt"
-            assert _rows(table) == ["docs", "incoming", "report.txt"]
+            assert _rows(table) == ["..", "docs", "incoming", "report.txt"]
             assert input_.value == "~/report.txt"
             label = str(app.query_one("#destination-path-label", Label).render())
             assert "Remote Path: ~/report.txt  [file]" in label
@@ -379,7 +482,7 @@ class TestDestinationBrowserTUI:
                 lambda: browser.destination == "~"
                 and app.query_one("#remote-path", Input).value == "~",
             )
-            assert _rows(table) == ["docs", "incoming", "report.txt"]
+            assert _rows(table) == ["..", "docs", "incoming", "report.txt"]
 
             await pilot.press("q")
             await pilot.pause()
@@ -394,10 +497,10 @@ class TestDestinationBrowserTUI:
 
             table.focus()
             await pilot.pause()
-            table.move_cursor(row=0, column=0)
-            await pilot.press("j")  # to 'incoming'
+            table.move_cursor(row=1, column=0)
+            await pilot.press("j")  # '..' and docs precede it, so to 'incoming'
             await pilot.pause()
-            assert table.cursor_row == 1
+            assert table.cursor_row == 2
             await pilot.press("enter")
             assert await _wait_until(
                 pilot,
@@ -440,12 +543,12 @@ class TestDestinationBrowserTUI:
 
             assert await _wait_until(
                 pilot,
-                lambda: _rows(table) == ["docs", "incoming", "report.txt"],
+                lambda: _rows(table) == ["..", "docs", "incoming", "report.txt"],
             )
 
             await pilot.press("R")
             await pilot.pause()
-            assert _rows(table) == ["docs", "incoming", "report.txt"]
+            assert _rows(table) == ["..", "docs", "incoming", "report.txt"]
             assert any(
                 n.message == "Destination refreshed" for n in app._notifications
             )
@@ -479,6 +582,107 @@ class TestDestinationBrowserTUI:
                     pilot, lambda: browser.destination == "~/docs"
                 )
                 assert app._remote_destination == "~/docs"
+
+                await pilot.press("q")
+                await pilot.pause()
+
+    async def test_home_offers_up_to_root(self, monkeypatch) -> None:
+        """'..' from home lists '/'; at '/' there is no '..'."""
+        app = TailshareApp()
+        async with app.run_test(size=(120, 35)) as pilot:
+            await _select_and_connect(app, monkeypatch, pilot)
+            browser = app.query_one("#remote-destination", RemoteDestinationBrowser)
+            table = browser.query_one("#destination-file-table", DataTable)
+
+            assert await _wait_until(
+                pilot,
+                lambda: _rows(table) == ["..", "docs", "incoming", "report.txt"],
+            )
+            table.post_message(DataTable.RowSelected(table, 0, RowKey("..")))
+            assert await _wait_until(
+                pilot,
+                lambda: browser.destination == "/"
+                and app.query_one("#remote-path", Input).value == "/",
+            )
+            assert _rows(table) == ["home", "mnt"]
+
+            await pilot.press("q")
+            await pilot.pause()
+
+    async def test_typed_absolute_path_points_browser(self, monkeypatch) -> None:
+        """'/mnt/hdd/' lands on /mnt/hdd (trailing slash normalized)."""
+        app = TailshareApp()
+        async with app.run_test(size=(120, 35)) as pilot:
+            await _select_and_connect(app, monkeypatch, pilot)
+            browser = app.query_one("#remote-destination", RemoteDestinationBrowser)
+            table = browser.query_one("#destination-file-table", DataTable)
+            input_ = app.query_one("#remote-path", Input)
+
+            input_.value = "/mnt/hdd/"
+            input_.post_message(Input.Blurred(input_, input_.value))
+            assert await _wait_until(
+                pilot,
+                lambda: _rows(table) == ["..", "data"]
+                and browser.destination == "/mnt/hdd",
+            )
+            assert input_.value == "/mnt/hdd"
+            label = str(app.query_one("#destination-path-label", Label).render())
+            assert "Remote Path: /mnt/hdd" in label
+
+            table.post_message(DataTable.RowSelected(table, 1, RowKey("data")))
+            assert await _wait_until(
+                pilot,
+                lambda: browser.destination == "/mnt/hdd/data"
+                and _rows(table) == ["..", "vacation.iso"],
+            )
+
+            await pilot.press("q")
+            await pilot.pause()
+
+    async def test_denied_destination_shows_not_accessible(self, monkeypatch) -> None:
+        app = TailshareApp()
+        async with app.run_test(size=(120, 35)) as pilot:
+            await _select_and_connect(app, monkeypatch, pilot)
+            browser = app.query_one("#remote-destination", RemoteDestinationBrowser)
+            table = browser.query_one("#destination-file-table", DataTable)
+            input_ = app.query_one("#remote-path", Input)
+
+            input_.value = "/mnt/secret"
+            input_.post_message(Input.Blurred(input_, input_.value))
+            assert await _wait_until(
+                pilot,
+                lambda: "[not accessible]"
+                in str(app.query_one("#destination-path-label", Label).render()),
+            )
+
+            assert browser.destination == "/mnt/secret"
+            assert browser._path == "/mnt"
+            assert _rows(table) == ["..", "hdd", "secret"]
+            label = str(app.query_one("#destination-path-label", Label).render())
+            assert "Remote Path: /mnt/secret  [not accessible]" in label
+
+            await pilot.press("q")
+            await pilot.pause()
+
+    async def test_send_uses_normalized_destination(self, monkeypatch, tmp_path) -> None:
+        """A typed trailing slash does not leak into the queued target."""
+        source = tmp_path / "a.txt"
+        source.write_text("hello")
+
+        app = TailshareApp()
+        with patch.object(app, "_start_transfer_worker"):
+            async with app.run_test(size=(120, 35)) as pilot:
+                await _select_and_connect(app, monkeypatch, pilot)
+                app._selected_path = str(source)
+                app.query_one("#remote-path", Input).value = "/mnt/hdd/"
+
+                app._send_files()
+                await pilot.pause()
+
+                tasks = app._transfer_manager.get_all_tasks()
+                assert len(tasks) == 1
+                assert tasks[0].target_path == "/mnt/hdd"
+                assert app._remote_destination == "/mnt/hdd"
 
                 await pilot.press("q")
                 await pilot.pause()

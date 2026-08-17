@@ -422,6 +422,13 @@ class RemoteDestinationBrowser(Vertical):
     the destination, and the path label shows the exact destination
     plus a note when the listing is of an ancestor.
 
+    Browsing starts at '~' (home) but is not limited to it: the true
+    root is '/', so '..' from home walks up to it (on remotes that are
+    not chroot-jailed). A destination that is access-denied, or whose
+    ancestors cannot be listed at all, is flagged with a
+    '[not accessible]' note instead of silently showing another
+    directory.
+
     Navigating the listing updates the destination and reports it via
     the ``on_destination`` callback so the remote path input stays in
     sync; the input points the browser back via ``set_destination``.
@@ -488,9 +495,22 @@ class RemoteDestinationBrowser(Vertical):
                 column.auto_width = False
                 table.refresh()
 
+    @staticmethod
+    def _normalize_destination(path: str) -> str:
+        """Canonical form of a destination path.
+
+        Whitespace is stripped, an empty value becomes '~', and a
+        trailing slash is dropped (except for the root '/') so that
+        '/mnt/hdd/' and '/mnt/hdd' name the same destination.
+        """
+        path = path.strip() or "~"
+        if path != "/" and path.endswith("/"):
+            path = path.rstrip("/")
+        return path
+
     def set_destination(self, path: str) -> None:
         """Point the browser at a destination (from the path input)."""
-        path = path.strip() or "~"
+        path = self._normalize_destination(path)
         if path == self._destination:
             return
         self._destination = path
@@ -519,8 +539,8 @@ class RemoteDestinationBrowser(Vertical):
             if generation == self._refresh_generation:
                 self._path = path
                 self._entries = []
-                if path not in ("~", ".", "", "/"):
-                    # Add parent directory entry
+                if path != "/":
+                    # Add parent directory entry; '/' is the true root
                     self._entries.append(("..", True))
                 self._entries.extend(entries)
                 self._note = note
@@ -567,32 +587,50 @@ class RemoteDestinationBrowser(Vertical):
 
         If the destination itself is a directory it is listed directly.
         Otherwise the walk goes up to the nearest existing directory,
-        which is listed instead, with a note explaining the difference.
+        which is listed instead, with a note explaining the difference:
+        '[file]' for an existing file destination, '[will be created]'
+        for a missing one, '[not accessible]' when the destination is
+        access-denied or no ancestor can be listed at all (jailed or
+        permission-limited remote).
         """
-        dest = destination.strip() or "~"
-        dest_state = sftp_client.is_remote_dir(dest)
-        if dest_state is True:
+        dest = RemoteDestinationBrowser._normalize_destination(destination)
+        dest_state = sftp_client.probe_remote(dest)
+        if dest_state == "dir":
             return dest, sftp_client.list_remote_dir(dest), ""
 
         listing = dest
-        while sftp_client.is_remote_dir(listing) is not True:
+        state = dest_state
+        while state != "dir":
             parent = RemoteDestinationBrowser._parent_remote(listing)
             if parent is None or parent == listing:
                 break
             listing = parent
+            state = sftp_client.probe_remote(listing)
 
-        note = "  [file]" if dest_state is False else "  [will be created]"
+        if state != "dir":
+            return listing, [], "  [not accessible]"
+
+        if dest_state == "file":
+            note = "  [file]"
+        elif dest_state == "denied":
+            note = "  [not accessible]"
+        else:
+            note = "  [will be created]"
         return listing, sftp_client.list_remote_dir(listing), note
 
     @staticmethod
     def _parent_remote(path: str) -> str | None:
-        """Parent of a remote path; None when already at a root.
+        """Parent of a remote path; None when already at the root.
 
-        '~' is the home root (parent of top-level home-relative paths);
-        absolute paths stop at '/'.
+        The filesystem root is '/'. '~' (home) is a regular directory
+        whose parent is '/', so the browser can navigate above home on
+        remotes that are not chroot-jailed (on a jailed remote '/' is
+        the jail root itself, so '..' from home harmlessly stays put).
         """
-        if path in ("", "~", "."):
+        if path == "/":
             return None
+        if path in ("", "~", "."):
+            return "/"
         if path.startswith("~"):
             parent = str(Path(path[1:]).parent)
             if parent in ("", ".", "/"):
@@ -601,7 +639,7 @@ class RemoteDestinationBrowser(Vertical):
         if path.startswith("/"):
             return str(Path(path).parent)
         parent = str(Path(path).parent)
-        if parent in (".",):
+        if parent == ".":
             return "~"
         return parent
 
@@ -1190,10 +1228,13 @@ class TailshareApp(App[None]):
 
     def _commit_remote_path_input(self) -> None:
         """Commit the remote path input's value to the destination."""
-        value = self.query_one("#remote-path", Input).value.strip() or "~"
+        value = RemoteDestinationBrowser._normalize_destination(
+            self.query_one("#remote-path", Input).value
+        )
         if value == self._remote_destination:
             return
         self._remote_destination = value
+        self.query_one("#remote-path", Input).value = value
         self.query_one("#remote-destination", RemoteDestinationBrowser).set_destination(
             value
         )
@@ -1377,16 +1418,14 @@ class TailshareApp(App[None]):
 
         # Get credentials and remote path. Commit the input first so the
         # destination browser and state agree even if the blur has not
-        # been processed yet (Send pressed right after typing).
+        # been processed yet (Send pressed right after typing), then use
+        # the canonical (normalized) destination.
         self._commit_remote_path_input()
 
         user = self.query_one("#remote-user", Input).value.strip() or None
         password = self.query_one("#remote-password", Input).value.strip() or None
 
-        remote_path_input = self.query_one("#remote-path", Input)
-        remote_path = remote_path_input.value.strip()
-        if not remote_path:
-            remote_path = "~"
+        remote_path = self._remote_destination
 
         # Queue the transfer
         try:

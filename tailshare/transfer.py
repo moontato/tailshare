@@ -7,6 +7,7 @@ This module handles:
 - Error handling and retry logic
 """
 
+import errno
 import logging
 import os
 import stat
@@ -295,6 +296,37 @@ class SFTPClient:
             return None
 
         return stat.S_ISDIR(stat_result.st_mode)
+
+    def probe_remote(self, path: str) -> str:
+        """Probe a remote path and classify what it is.
+
+        Unlike is_remote_dir this distinguishes "missing" from
+        "access denied", so callers can tell a genuinely absent path
+        (safe to create) apart from one the session may not reach
+        (permission denied, chroot-jailed namespace, ...).
+
+        Args:
+            path: Remote path to probe ('~' expands to the home directory)
+
+        Returns:
+            One of 'dir', 'file', 'denied', 'missing', 'unavailable'
+        """
+        if not self._sftp_client:
+            return "unavailable"
+
+        if path == "~":
+            path = "."
+        elif path.startswith("~"):
+            path = path.replace("~", ".", 1)
+
+        try:
+            stat_result = self._sftp_client.stat(path)
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EPERM):
+                return "denied"
+            return "missing"
+
+        return "dir" if stat.S_ISDIR(stat_result.st_mode) else "file"
 
     def transfer_file(
         self,

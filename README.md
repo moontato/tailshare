@@ -59,13 +59,13 @@ tailshare --version
 
 1. Pick a device first — the **Destination** browser (right-hand panel) connects automatically and lists the remote home directory. It sits side-by-side with the local file browser so you can see both ends at once.
 2. Choose where to send:
-   - **Browse** the Destination panel — click a folder to enter it, `..` to go up. Entering a folder sets it as the destination.
-   - **Type** a path into the **Remote path** input at the bottom (commit with `Enter` or by clicking away).
-   - The two are always in sync: browsing updates the input, and committing the input re-points the browser, so there is a single unambiguous destination. A destination that names an existing file overwrites that file; one that doesn't exist yet is created at send time (the browser shows the nearest existing ancestor with a `[will be created]` note).
+   - **Browse** the Destination panel — click a folder to enter it, `..` to go up (all the way to `/` on remotes that are not chroot-jailed). Entering a folder sets it as the destination.
+   - **Type** a path into the **Remote path** input at the bottom (commit with `Enter` or by clicking away). Trailing slashes are normalized, so `/mnt/hdd/` and `/mnt/hdd` are the same destination.
+   - The two are always in sync: browsing updates the input, and committing the input re-points the browser, so there is a single unambiguous destination. A destination that names an existing file overwrites that file; one that doesn't exist yet is created at send time (the browser shows the nearest existing ancestor with a `[will be created]` note); one the remote will not let you access is flagged `[not accessible]` (permission denied or a jailed SFTP namespace).
 3. Navigate to the file or folder in the local file browser (`j`/`k`, `Enter`, `r` to refresh).
 4. Click **Send** (or press `s`) to queue the transfer.
 
-`~`-relative and relative destination paths are allowed; `..` traversal is rejected.
+`~`-relative, relative, and absolute destination paths are allowed; `..` traversal in the input is rejected.
 
 ### Fetching files (Fetch tab)
 

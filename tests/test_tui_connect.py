@@ -32,6 +32,15 @@ class FakeSFTPClient:
     def is_remote_dir(self, path: str) -> bool | None:
         return path == "docs"
 
+    def probe_remote(self, path: str) -> str:
+        if path in ("~", ".", ""):
+            return "dir"
+        if path == "docs":
+            return "dir"
+        if path == "file.txt":
+            return "file"
+        return "missing"
+
 
 def make_devices() -> list[Device]:
     return [
