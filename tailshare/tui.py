@@ -215,6 +215,35 @@ class FileBrowser(Vertical):
         self.focus()
 
 
+def remote_parent(path: str) -> str | None:
+    """Parent of a remote path; None when already at the root.
+
+    Shared by the destination and fetch browsers. The filesystem root
+    is '/'; '~' (home) is a regular directory whose parent is '/'.
+    """
+    if path == "/":
+        return None
+    if path in ("", "~", "."):
+        return "/"
+    if path.startswith("~"):
+        parent = str(Path(path[1:]).parent)
+        if parent in ("", ".", "/"):
+            return "~"
+        return f"~{parent}"
+    if path.startswith("/"):
+        return str(Path(path).parent)
+    parent = str(Path(path).parent)
+    if parent == ".":
+        return "~"
+    return parent
+
+
+def _error_message(error: Exception) -> str:
+    """Human-readable text for a background-worker failure."""
+    text = str(error).strip().rstrip(":").strip()
+    return text or "Connection lost"
+
+
 class RemoteFileBrowser(Vertical):
     """Remote file browser widget for selecting files/folders to fetch."""
 
@@ -241,6 +270,7 @@ class RemoteFileBrowser(Vertical):
         self._entries: list[tuple[str, bool]] = []  # (name, is_directory)
         self._name_column_key: Any = None
         self._app = app
+        self._home_parent: str | None = None
         self._refresh_generation = 0
 
     @property
@@ -281,6 +311,7 @@ class RemoteFileBrowser(Vertical):
             sftp_client = getattr(self._app, "_remote_sftp_client", None)
 
         if sftp_client is None:
+            self._home_parent = None
             self._entries = [("<Not Connected>", False)]
             self._update_table()
             return
@@ -291,12 +322,13 @@ class RemoteFileBrowser(Vertical):
         self._refresh_generation += 1
         generation = self._refresh_generation
 
-        def on_listed(entries: list[tuple[str, bool]]) -> None:
+        def on_listed(entries: list[tuple[str, bool]], home_parent: str | None) -> None:
             if generation == self._refresh_generation:
-                self._show_entries(path, entries)
+                self._show_entries(path, entries, home_parent)
 
         def on_error(message: str) -> None:
             if generation == self._refresh_generation:
+                self._home_parent = None
                 self._show_entries(path, [(message, False)])
 
         self.run_worker(
@@ -312,20 +344,44 @@ class RemoteFileBrowser(Vertical):
         on_error: Any,
     ) -> None:
         """List a remote directory in a background thread."""
+        current = (
+            self._app._remote_sftp_client if self._app is not None else sftp_client
+        )
+        if sftp_client is not current:
+            # The device was switched while this refresh was in flight.
+            return
         try:
             entries = sftp_client.list_remote_dir(path)
-        except TransferError as e:
-            self.call_later(on_error, str(e))
+            home_parent: str | None = None
+            if path in ("~", ".", ""):
+                canonical = sftp_client.canonicalize(".")
+                if canonical:
+                    home_parent = remote_parent(canonical)
+        except Exception as e:
+            self.call_later(on_error, _error_message(e))
             return
-        self.call_later(on_listed, entries)
+        self.call_later(on_listed, entries, home_parent)
 
-    def _show_entries(self, path: str, entries: list[tuple[str, bool]]) -> None:
+    def _show_entries(
+        self,
+        path: str,
+        entries: list[tuple[str, bool]],
+        home_parent: str | None = None,
+    ) -> None:
         """Apply a directory listing to the table (main thread)."""
         self._entries = []
 
-        if path != "~" and path != ".":
-            # Add parent directory entry
-            self._entries.append(("..", True))
+        if path in ("~", ".", ""):
+            # At home, offer '..' only when the remote has a parent
+            # directory above it (not the case on chroot-jailed remotes).
+            self._home_parent = home_parent
+            if home_parent is not None:
+                self._entries.append(("..", True))
+        else:
+            self._home_parent = None
+            if path != "/":
+                # Add parent directory entry; '/' is the true root
+                self._entries.append(("..", True))
 
         self._entries.extend(entries)
         self._update_table()
@@ -387,11 +443,13 @@ class RemoteFileBrowser(Vertical):
             if name == "..":
                 # Go to parent directory
                 current_path = self._path
-                if current_path == "." or current_path == "~":
-                    parent = "~"
+                if current_path in ("~", ".", ""):
+                    parent = self._home_parent
                 else:
                     parent = str(Path(current_path).parent)
-                self._path = parent if parent else "~"
+                if not parent:
+                    return
+                self._path = parent
                 self._refresh_entries()
             elif is_dir:
                 # Enter directory
@@ -422,12 +480,13 @@ class RemoteDestinationBrowser(Vertical):
     the destination, and the path label shows the exact destination
     plus a note when the listing is of an ancestor.
 
-    Browsing starts at '~' (home) but is not limited to it: the true
-    root is '/', so '..' from home walks up to it (on remotes that are
-    not chroot-jailed). A destination that is access-denied, or whose
-    ancestors cannot be listed at all, is flagged with a
-    '[not accessible]' note instead of silently showing another
-    directory.
+    Browsing starts at '~' (home) but is not limited to it: '..' from
+    home goes to the parent of home (e.g. /home) and keeps climbing to
+    '/' (on remotes that are not chroot-jailed; a jailed remote has no
+    parent above its jail root, so '..' is simply not offered). A
+    destination that is access-denied, or whose ancestors cannot be
+    listed at all, is flagged with a '[not accessible]' note instead of
+    silently showing another directory.
 
     Navigating the listing updates the destination and reports it via
     the ``on_destination`` callback so the remote path input stays in
@@ -463,6 +522,7 @@ class RemoteDestinationBrowser(Vertical):
         self._name_column_key: Any = None
         self._app = app
         self._on_destination = on_destination
+        self._home_parent: str | None = None
         self._refresh_generation = 0
 
     @property
@@ -525,6 +585,7 @@ class RemoteDestinationBrowser(Vertical):
         if sftp_client is None:
             self._path = self._destination
             self._note = ""
+            self._home_parent = None
             self._entries = [("<Not Connected>", False)]
             self._update_table()
             return
@@ -535,13 +596,23 @@ class RemoteDestinationBrowser(Vertical):
         self._refresh_generation += 1
         generation = self._refresh_generation
 
-        def on_resolved(path: str, entries: list, note: str) -> None:
+        def on_resolved(
+            path: str, entries: list, note: str, home_parent: str | None
+        ) -> None:
             if generation == self._refresh_generation:
                 self._path = path
                 self._entries = []
-                if path != "/":
-                    # Add parent directory entry; '/' is the true root
-                    self._entries.append(("..", True))
+                if path in ("~", ".", ""):
+                    # At home, offer '..' only when the remote has a
+                    # parent directory above it (not on jailed remotes).
+                    self._home_parent = home_parent
+                    if home_parent is not None:
+                        self._entries.append(("..", True))
+                else:
+                    self._home_parent = None
+                    if path != "/":
+                        # Add parent directory entry; '/' is the root
+                        self._entries.append(("..", True))
                 self._entries.extend(entries)
                 self._note = note
                 self._update_table()
@@ -550,6 +621,7 @@ class RemoteDestinationBrowser(Vertical):
             if generation == self._refresh_generation:
                 self._path = destination
                 self._note = ""
+                self._home_parent = None
                 self._entries = [(message, False)]
                 self._update_table()
 
@@ -572,12 +644,26 @@ class RemoteDestinationBrowser(Vertical):
         on_error: Any,
     ) -> None:
         """Find and list the destination's deepest existing directory."""
+        current = (
+            self._app._remote_sftp_client if self._app is not None else sftp_client
+        )
+        if sftp_client is not current:
+            # The device was switched while this refresh was in flight.
+            return
         try:
             path, entries, note = self._find_listing(sftp_client, destination)
-        except TransferError as e:
-            self.call_later(on_error, str(e))
+            home_parent: str | None = None
+            if path in ("~", ".", ""):
+                canonical = sftp_client.canonicalize(".")
+                if canonical:
+                    home_parent = remote_parent(canonical)
+        except Exception as e:
+            # A dropped connection (paramiko SSHException), a TransferError,
+            # or anything else the remote throws must surface as an entry,
+            # never as a worker crash.
+            self.call_later(on_error, _error_message(e))
             return
-        self.call_later(on_resolved, path, entries, note)
+        self.call_later(on_resolved, path, entries, note, home_parent)
 
     @staticmethod
     def _find_listing(
@@ -601,7 +687,7 @@ class RemoteDestinationBrowser(Vertical):
         listing = dest
         state = dest_state
         while state != "dir":
-            parent = RemoteDestinationBrowser._parent_remote(listing)
+            parent = remote_parent(listing)
             if parent is None or parent == listing:
                 break
             listing = parent
@@ -618,30 +704,9 @@ class RemoteDestinationBrowser(Vertical):
             note = "  [will be created]"
         return listing, sftp_client.list_remote_dir(listing), note
 
-    @staticmethod
-    def _parent_remote(path: str) -> str | None:
-        """Parent of a remote path; None when already at the root.
-
-        The filesystem root is '/'. '~' (home) is a regular directory
-        whose parent is '/', so the browser can navigate above home on
-        remotes that are not chroot-jailed (on a jailed remote '/' is
-        the jail root itself, so '..' from home harmlessly stays put).
-        """
-        if path == "/":
-            return None
-        if path in ("", "~", "."):
-            return "/"
-        if path.startswith("~"):
-            parent = str(Path(path[1:]).parent)
-            if parent in ("", ".", "/"):
-                return "~"
-            return f"~{parent}"
-        if path.startswith("/"):
-            return str(Path(path).parent)
-        parent = str(Path(path).parent)
-        if parent == ".":
-            return "~"
-        return parent
+    # Shared path algebra (also used by RemoteFileBrowser); kept here
+    # as an alias for backward compatibility with tests.
+    _parent_remote = staticmethod(remote_parent)
 
     @staticmethod
     def _join(path: str, name: str) -> str:
@@ -726,7 +791,10 @@ class RemoteDestinationBrowser(Vertical):
             return
 
         if name == "..":
-            parent = self._parent_remote(self._path)
+            if self._path in ("~", ".", ""):
+                parent = self._home_parent
+            else:
+                parent = remote_parent(self._path)
             if parent is None:
                 return
             self._navigate(parent)

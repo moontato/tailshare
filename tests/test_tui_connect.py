@@ -1,6 +1,7 @@
 """TUI tests for device selection, async SFTP connect, and client lifecycle."""
 
 import pytest
+from paramiko.ssh_exception import SSHException
 from textual.widgets import DataTable
 
 import tailshare.config as config_module
@@ -41,6 +42,10 @@ class FakeSFTPClient:
             return "file"
         return "missing"
 
+    def canonicalize(self, path: str) -> str | None:
+        # Model a jailed remote: the home root has no parent above it.
+        return "/"
+
 
 def make_devices() -> list[Device]:
     return [
@@ -77,6 +82,10 @@ async def _wait_until(pilot, predicate, attempts: int = 100) -> bool:
             return True
         await pilot.pause()
     return False
+
+
+def _rows(table: DataTable) -> list[str]:
+    return [table.get_cell_at((i, 0)) for i in range(table.row_count)]
 
 
 class TestRemoteConnection:
@@ -167,6 +176,41 @@ class TestRemoteConnection:
                 ),
             )
             assert app._remote_sftp_client is None
+
+            # The app must remain responsive after the failure.
+            await pilot.press("q")
+            await pilot.pause()
+
+    async def test_connection_drop_shows_error_and_survives(self, monkeypatch) -> None:
+        """A dropped SFTP connection surfaces an error entry, never a crash."""
+
+        class DroppingClient(FakeSFTPClient):
+            def probe_remote(self, path: str) -> str:
+                raise SSHException("Server connection dropped: ")
+
+            def list_remote_dir(self, path: str) -> list[tuple[str, bool]]:
+                raise SSHException("Server connection dropped: ")
+
+        devices = make_devices()
+        app = TailshareApp()
+        monkeypatch.setattr(tui_mod, "SFTPClient", DroppingClient)
+        monkeypatch.setattr(app._device_discovery, "discover", lambda: devices)
+        monkeypatch.setattr(app._device_discovery, "get_devices", lambda: devices)
+
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_device_by_key("m-dest")
+            assert await _wait_until(
+                pilot, lambda: app._remote_sftp_client is not None
+            )
+
+            dest_table = app.query_one("#destination-file-table", DataTable)
+            fetch_table = app.query_one("#remote-file-table", DataTable)
+            assert await _wait_until(
+                pilot,
+                lambda: "Server connection dropped" in _rows(dest_table)
+                and "Server connection dropped" in _rows(fetch_table),
+            )
 
             # The app must remain responsive after the failure.
             await pilot.press("q")

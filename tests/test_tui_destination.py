@@ -5,6 +5,7 @@ the destination: browsing updates the input, and committing the input
 re-points the browser.
 """
 
+import types
 from unittest.mock import patch
 
 import pytest
@@ -15,7 +16,11 @@ import tailshare.config as config_module
 import tailshare.tui as tui_mod
 from tailshare.devices import Device
 from tailshare.transfer import TransferError
-from tailshare.tui import RemoteDestinationBrowser, TailshareApp
+from tailshare.tui import (
+    RemoteDestinationBrowser,
+    RemoteFileBrowser,
+    TailshareApp,
+)
 
 
 class FakeRemoteFS:
@@ -83,6 +88,11 @@ class FakeRemoteFS:
         if p in self.FILES:
             return "file"
         return "missing"
+
+    def canonicalize(self, path: str) -> str | None:
+        if self.disconnected:
+            return None
+        return self._normalize(path)
 
     def is_remote_dir(self, path: str) -> bool | None:
         state = self.probe_remote(path)
@@ -272,6 +282,23 @@ class TestDestinationBrowserUnit:
         assert path == "/mnt"
         assert entries == [("hdd", True), ("secret", True)]
         assert note == "  [not accessible]"
+
+    def test_resolve_listing_ignores_stale_client(self) -> None:
+        """A refresh started on the old client is dropped after a switch."""
+        browser = RemoteDestinationBrowser()
+        browser._app = types.SimpleNamespace(_remote_sftp_client="current")
+        on_resolved, on_error = [], []
+        browser._resolve_listing("stale", "~", on_resolved.append, on_error.append)
+        assert on_resolved == []
+        assert on_error == []
+
+    def test_list_remote_dir_ignores_stale_client(self) -> None:
+        browser = RemoteFileBrowser()
+        browser._app = types.SimpleNamespace(_remote_sftp_client="current")
+        on_listed, on_error = [], []
+        browser._list_remote_dir("stale", "~", on_listed.append, on_error.append)
+        assert on_listed == []
+        assert on_error == []
 
     def test_find_listing_no_accessible_ancestor(self) -> None:
         class EverythingDenied:
@@ -586,8 +613,9 @@ class TestDestinationBrowserTUI:
                 await pilot.press("q")
                 await pilot.pause()
 
-    async def test_home_offers_up_to_root(self, monkeypatch) -> None:
-        """'..' from home lists '/'; at '/' there is no '..'."""
+    async def test_dotdot_from_home_climbs_to_root(self, monkeypatch) -> None:
+        """'..' from home goes to the parent of home (/home), then '/';
+        at '/' there is no '..'."""
         app = TailshareApp()
         async with app.run_test(size=(120, 35)) as pilot:
             await _select_and_connect(app, monkeypatch, pilot)
@@ -601,9 +629,74 @@ class TestDestinationBrowserTUI:
             table.post_message(DataTable.RowSelected(table, 0, RowKey("..")))
             assert await _wait_until(
                 pilot,
+                lambda: browser.destination == "/home"
+                and app.query_one("#remote-path", Input).value == "/home",
+            )
+            assert _rows(table) == ["..", "user"]
+
+            table.post_message(DataTable.RowSelected(table, 0, RowKey("..")))
+            assert await _wait_until(
+                pilot,
                 lambda: browser.destination == "/"
                 and app.query_one("#remote-path", Input).value == "/",
             )
+            assert _rows(table) == ["home", "mnt"]
+
+            await pilot.press("q")
+            await pilot.pause()
+
+    async def test_jailed_home_offers_no_dotdot(self, monkeypatch) -> None:
+        """On a jailed remote the home listing offers no '..' (no parent)."""
+
+        class JailedFS(FakeRemoteFS):
+            def canonicalize(self, path: str) -> str | None:
+                if self.disconnected:
+                    return None
+                if path in ("~", ".", ""):
+                    return "/"
+                return self._normalize(path)
+
+        app = TailshareApp()
+        async with app.run_test(size=(120, 35)) as pilot:
+            device = make_device()
+            fake = JailedFS(device)
+            monkeypatch.setattr(tui_mod, "SFTPClient", lambda d: fake)
+            monkeypatch.setattr(app._device_discovery, "discover", lambda: [device])
+            monkeypatch.setattr(
+                app._device_discovery, "get_devices", lambda: [device]
+            )
+
+            app._select_device_by_key("m-dest")
+            assert await _wait_until(
+                pilot, lambda: app._remote_sftp_client is not None
+            )
+            table = app.query_one("#destination-file-table", DataTable)
+            assert await _wait_until(
+                pilot,
+                lambda: _rows(table) == ["docs", "incoming", "report.txt"],
+            )
+
+            await pilot.press("q")
+            await pilot.pause()
+
+    async def test_remote_file_browser_dotdot_above_home(self, monkeypatch) -> None:
+        """The fetch-tab remote browser also climbs above home to '/'."""
+        app = TailshareApp()
+        async with app.run_test(size=(120, 35)) as pilot:
+            await _select_and_connect(app, monkeypatch, pilot)
+            browser = app.query_one("#remote-file-browser", RemoteFileBrowser)
+            table = browser.query_one("#remote-file-table", DataTable)
+
+            assert await _wait_until(
+                pilot,
+                lambda: _rows(table) == ["..", "docs", "incoming", "report.txt"],
+            )
+            table.post_message(DataTable.RowSelected(table, 0, RowKey("..")))
+            assert await _wait_until(pilot, lambda: browser.path == "/home")
+            assert _rows(table) == ["..", "user"]
+
+            table.post_message(DataTable.RowSelected(table, 0, RowKey("..")))
+            assert await _wait_until(pilot, lambda: browser.path == "/")
             assert _rows(table) == ["home", "mnt"]
 
             await pilot.press("q")

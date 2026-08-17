@@ -328,6 +328,31 @@ class SFTPClient:
 
         return "dir" if stat.S_ISDIR(stat_result.st_mode) else "file"
 
+    def canonicalize(self, path: str) -> str | None:
+        """Resolve a remote path to its canonical absolute form.
+
+        Best effort: returns None when not connected or the server
+        cannot resolve the path, so callers can degrade gracefully.
+
+        Args:
+            path: Remote path to resolve ('~' expands to the home directory)
+
+        Returns:
+            The canonical absolute path (e.g. '/home/user' for '.'), or None
+        """
+        if not self._sftp_client:
+            return None
+
+        if path == "~":
+            path = "."
+        elif path.startswith("~"):
+            path = path.replace("~", ".", 1)
+
+        try:
+            return self._sftp_client.canonicalize(path)
+        except Exception:
+            return None
+
     def transfer_file(
         self,
         source_path: str,
