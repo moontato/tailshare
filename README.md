@@ -55,15 +55,23 @@ tailshare --version
 3. Optionally enter the remote **username** and **password** in the inputs below the device list. Leave both empty to use your local username and SSH key/agent authentication.
 4. Press **Refresh** to rediscover devices and (re)connect the remote browser, or **Test** to check SSH connectivity to the selected device.
 
+While a connection is in flight both remote browsers show `Connecting to <device>...`. If the connection fails they keep showing `Cannot connect to <device>: <reason>` until you pick a device again — so a failed or missing connection is always visible, never just an empty `<Not Connected>` panel.
+
 ### Sending files (Send tab)
 
-1. Navigate to the file or folder in the local file browser (`j`/`k`, `Enter`, `r` to refresh).
-2. Enter the remote destination path (default `~` = the remote home directory). `~`-relative and relative paths are allowed; `..` traversal is rejected.
-3. Click **Send** (or press `s`) to queue the transfer.
+1. Pick a device first — the **Destination** browser (right-hand panel) connects automatically and lists the remote home directory. It sits side-by-side with the local file browser so you can see both ends at once.
+2. Choose where to send:
+   - **Browse** the Destination panel — click a folder to enter it, `..` to go up (from home, to the parent of home such as `/home`, and all the way to `/`). On a chroot-jailed remote (or `HOME=/`) home *is* the root of its filesystem: the listing is marked `[home is root]` and selecting `..` explains that there is nothing above it. Entering a folder sets it as the destination.
+   - **Type** a path into the **Remote path** input at the bottom (commit with `Enter` or by clicking away). Trailing slashes are normalized, so `/mnt/hdd/` and `/mnt/hdd` are the same destination.
+   - The two are always in sync: browsing updates the input, and committing the input re-points the browser, so there is a single unambiguous destination. A destination that names an existing file overwrites that file; one that doesn't exist yet is created at send time (the browser shows the nearest existing ancestor with a `[will be created]` note); one the remote will not let you access is flagged `[not accessible]` (permission denied or a jailed SFTP namespace).
+3. Navigate to the file or folder in the local file browser (`j`/`k`, `Enter`, `r` to refresh).
+4. Click **Send** (or press `s`) to queue the transfer.
+
+`~`-relative, relative, and absolute destination paths are allowed; `..` traversal in the input is rejected.
 
 ### Fetching files (Fetch tab)
 
-1. Pick a device first — the remote file browser connects automatically and lists the remote home directory (click `..` to go up, `r` to refresh).
+1. Pick a device first — the remote file browser connects automatically and lists the remote home directory (click `..` to go up — including above home, all the way to `/`; on a chroot-jailed remote there is nothing above home and `..` says so — `r` to refresh).
 2. Select a file or directory in the remote browser.
 3. Enter the local destination path (default `~`).
 4. Click **Fetch** (or press `f`) to queue the download.
@@ -72,11 +80,12 @@ tailshare --version
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Navigate file browser |
+| `j` / `k` | Navigate the focused file browser (local, destination, or fetch) |
 | `Enter` | Select file / enter directory |
 | `x` / `Delete` | Remove the selected job from the transfer queue (cancels it if already transferring) |
-| `r` | Refresh current view |
-| `R` | Refresh remote file browser (Fetch tab) |
+| `r` | Refresh the focused browser |
+| `R` | Refresh both remote browsers (destination on Send, source on Fetch) |
+| `Esc` | Clear the remote/local path inputs (destination resets to `~`) |
 | `d` | Refresh device list |
 | `s` | Send selected files |
 | `f` | Fetch selected files |

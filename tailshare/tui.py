@@ -13,6 +13,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -152,12 +153,12 @@ class FileBrowser(Vertical):
 
         self.query_one("#path-label", Label).update(f"[b]Path:[/b] {self._path}")
 
-    def navigate_down(self) -> None:
+    def action_navigate_down(self) -> None:
         """Navigate selection down."""
         table = self.query_one("#file-table", DataTable)
         table.action_cursor_down()
 
-    def navigate_up(self) -> None:
+    def action_navigate_up(self) -> None:
         """Navigate selection up."""
         table = self.query_one("#file-table", DataTable)
         table.action_cursor_up()
@@ -214,6 +215,56 @@ class FileBrowser(Vertical):
         self.focus()
 
 
+def remote_parent(path: str) -> str | None:
+    """Parent of a remote path; None when already at the root.
+
+    Shared by the destination and fetch browsers. The filesystem root
+    is '/'; '~' (home) is a regular directory whose parent is '/'.
+    """
+    if path == "/":
+        return None
+    if path in ("", "~", "."):
+        return "/"
+    if path.startswith("~"):
+        parent = str(Path(path[1:]).parent)
+        if parent in ("", ".", "/"):
+            return "~"
+        return f"~{parent}"
+    if path.startswith("/"):
+        return str(Path(path).parent)
+    parent = str(Path(path).parent)
+    if parent == ".":
+        return "~"
+    return parent
+
+
+def _error_message(error: Exception) -> str:
+    """Human-readable text for a background-worker failure."""
+    text = str(error).strip().rstrip(":").strip()
+    return text or "Connection lost"
+
+
+def _notify_no_parent_above_home(widget: Any, canonical: str | None) -> None:
+    """Explain why '..' cannot leave home on this remote.
+
+    canonical == '/' means the session's home *is* the root of its
+    filesystem namespace (chroot-jailed account or HOME=/); None means
+    the server refused to resolve it.
+    """
+    if canonical == "/":
+        message = (
+            "No folder above home: on this remote, home is the root of "
+            "its filesystem (chroot-jailed account or HOME=/). There is "
+            "nothing to browse above it."
+        )
+    else:
+        message = (
+            "Could not determine the folder above home on this remote "
+            "(the server refused to resolve it)."
+        )
+    widget.app.notify(message, title="No Parent Folder")
+
+
 class RemoteFileBrowser(Vertical):
     """Remote file browser widget for selecting files/folders to fetch."""
 
@@ -240,6 +291,7 @@ class RemoteFileBrowser(Vertical):
         self._entries: list[tuple[str, bool]] = []  # (name, is_directory)
         self._name_column_key: Any = None
         self._app = app
+        self._home_canonical: str | None = None
         self._refresh_generation = 0
 
     @property
@@ -280,6 +332,7 @@ class RemoteFileBrowser(Vertical):
             sftp_client = getattr(self._app, "_remote_sftp_client", None)
 
         if sftp_client is None:
+            self._home_canonical = None
             self._entries = [("<Not Connected>", False)]
             self._update_table()
             return
@@ -290,18 +343,45 @@ class RemoteFileBrowser(Vertical):
         self._refresh_generation += 1
         generation = self._refresh_generation
 
-        def on_listed(entries: list[tuple[str, bool]]) -> None:
+        def on_listed(
+            entries: list[tuple[str, bool]], home_canonical: str | None
+        ) -> None:
             if generation == self._refresh_generation:
-                self._show_entries(path, entries)
+                self._show_entries(path, entries, home_canonical)
 
         def on_error(message: str) -> None:
             if generation == self._refresh_generation:
+                self._home_canonical = None
                 self._show_entries(path, [(message, False)])
 
         self.run_worker(
             partial(self._list_remote_dir, sftp_client, path, on_listed, on_error),
             thread=True,
         )
+
+    def set_connect_state(
+        self, status: str, detail: str, device_name: str | None = None
+    ) -> None:
+        """Mirror the app's connection state in the listing.
+
+        'connecting' and 'failed' show a static message; 'idle' falls
+        back to the normal refresh (a listing when a client exists,
+        '<Not Connected>' otherwise). A live listing for the same
+        device is kept while a reconnect (e.g. the Refresh button) is
+        in flight.
+        """
+        if status == "idle":
+            self._refresh_entries()
+            return
+        if status == "connecting":
+            current = getattr(self._sftp_client, "device", None)
+            if current is not None and (
+                device_name is None or device_name == current.name
+            ):
+                return
+        self._home_canonical = None
+        self._entries = [(detail, False)]
+        self._update_table()
 
     def _list_remote_dir(
         self,
@@ -311,20 +391,41 @@ class RemoteFileBrowser(Vertical):
         on_error: Any,
     ) -> None:
         """List a remote directory in a background thread."""
+        current = (
+            self._app._remote_sftp_client if self._app is not None else sftp_client
+        )
+        if sftp_client is not current:
+            # The device was switched while this refresh was in flight.
+            return
         try:
             entries = sftp_client.list_remote_dir(path)
-        except TransferError as e:
-            self.call_later(on_error, str(e))
+            home_canonical: str | None = None
+            if path in ("~", ".", ""):
+                home_canonical = sftp_client.canonicalize(".")
+        except Exception as e:
+            self.call_later(on_error, _error_message(e))
             return
-        self.call_later(on_listed, entries)
+        self.call_later(on_listed, entries, home_canonical)
 
-    def _show_entries(self, path: str, entries: list[tuple[str, bool]]) -> None:
+    def _show_entries(
+        self,
+        path: str,
+        entries: list[tuple[str, bool]],
+        home_canonical: str | None = None,
+    ) -> None:
         """Apply a directory listing to the table (main thread)."""
         self._entries = []
 
-        if path != "~" and path != ".":
-            # Add parent directory entry
+        if path in ("~", ".", ""):
+            # '..' is always offered at home; when home has no parent
+            # above it, selecting it explains why.
+            self._home_canonical = home_canonical
             self._entries.append(("..", True))
+        else:
+            self._home_canonical = None
+            if path != "/":
+                # Add parent directory entry; '/' is the true root
+                self._entries.append(("..", True))
 
         self._entries.extend(entries)
         self._update_table()
@@ -343,12 +444,12 @@ class RemoteFileBrowser(Vertical):
         display_path = self._path if self._path != "." else "~"
         self.query_one("#remote-path-label", Label).update(f"[b]Remote Path:[/b] {display_path}")
 
-    def navigate_down(self) -> None:
+    def action_navigate_down(self) -> None:
         """Navigate selection down."""
         table = self.query_one("#remote-file-table", DataTable)
         table.action_cursor_down()
 
-    def navigate_up(self) -> None:
+    def action_navigate_up(self) -> None:
         """Navigate selection up."""
         table = self.query_one("#remote-file-table", DataTable)
         table.action_cursor_up()
@@ -386,11 +487,17 @@ class RemoteFileBrowser(Vertical):
             if name == "..":
                 # Go to parent directory
                 current_path = self._path
-                if current_path == "." or current_path == "~":
-                    parent = "~"
+                if current_path in ("~", ".", ""):
+                    canonical = self._home_canonical
+                    parent = remote_parent(canonical) if canonical else None
+                    if parent is None:
+                        _notify_no_parent_above_home(self, canonical)
+                        return
                 else:
                     parent = str(Path(current_path).parent)
-                self._path = parent if parent else "~"
+                    if not parent:
+                        return
+                self._path = parent
                 self._refresh_entries()
             elif is_dir:
                 # Enter directory
@@ -405,6 +512,378 @@ class RemoteFileBrowser(Vertical):
 
         except StopIteration:
             pass
+
+    def on_click(self, event: events.Click) -> None:
+        """Handle click events to select entries."""
+        self.focus()
+
+
+class RemoteDestinationBrowser(Vertical):
+    """Remote destination picker for the Send tab.
+
+    Tracks a *destination* path - the place files will be sent to -
+    which may be an existing directory, an existing file (overwrite),
+    or a path that does not exist yet (created at send time). The
+    listing always shows the deepest existing directory at or above
+    the destination, and the path label shows the exact destination
+    plus a note when the listing is of an ancestor.
+
+    Browsing starts at '~' (home) but is not limited to it: '..' from
+    home goes to the parent of home (e.g. /home) and keeps climbing to
+    '/'. When home has no parent above it (chroot-jailed account or
+    HOME=/), the home listing is marked '[home is root]' and selecting
+    '..' explains that there is nothing above. A destination that is
+    access-denied, or whose ancestors cannot be listed at all, is
+    flagged with a '[not accessible]' note instead of silently showing
+    another directory.
+
+    Navigating the listing updates the destination and reports it via
+    the ``on_destination`` callback so the remote path input stays in
+    sync; the input points the browser back via ``set_destination``.
+    Both views derive from the same destination string, so they can
+    never disagree about which destination is real.
+    """
+
+    can_focus = True
+
+    BINDINGS = [
+        Binding("j", "navigate_down", "Down", show=False),
+        Binding("k", "navigate_up", "Up", show=False),
+        Binding("Enter", "select", "Select", show=True),
+        Binding("r", "refresh", "Refresh", show=False),
+    ]
+
+    def __init__(
+        self,
+        *args: Any,
+        sftp_client: Any = None,
+        path: str = "~",
+        app: Any = None,
+        on_destination: Any = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._sftp_client = sftp_client
+        self._destination = path
+        self._path = path  # directory currently listed
+        self._note = ""
+        self._entries: list[tuple[str, bool]] = []  # (name, is_directory)
+        self._name_column_key: Any = None
+        self._app = app
+        self._on_destination = on_destination
+        self._home_canonical: str | None = None
+        self._refresh_generation = 0
+
+    @property
+    def destination(self) -> str:
+        """Current destination path."""
+        return self._destination
+
+    def compose(self) -> ComposeResult:
+        """Compose the destination browser layout."""
+        yield Label(id="destination-path-label")
+        yield DataTable(id="destination-file-table")
+
+    def on_mount(self) -> None:
+        """Refresh the listing when mounted."""
+        self._refresh()
+        self.call_after_refresh(self._set_column_width)
+
+    def on_resize(self, event: Resize) -> None:
+        """Handle resize to update column width."""
+        self._set_column_width()
+
+    def _set_column_width(self) -> None:
+        """Set the Name column width to fill the table."""
+        table = self.query_one("#destination-file-table", DataTable)
+        if table.columns and self._name_column_key:
+            column = table.columns.get(self._name_column_key)
+            if column:
+                available = table.container_size.width - 2 * table.cell_padding
+                column.width = max(available, 10)
+                column.auto_width = False
+                table.refresh()
+
+    @staticmethod
+    def _normalize_destination(path: str) -> str:
+        """Canonical form of a destination path.
+
+        Whitespace is stripped, an empty value becomes '~', and a
+        trailing slash is dropped (except for the root '/') so that
+        '/mnt/hdd/' and '/mnt/hdd' name the same destination.
+        """
+        path = path.strip() or "~"
+        if path != "/" and path.endswith("/"):
+            path = path.rstrip("/")
+        return path
+
+    def set_destination(self, path: str) -> None:
+        """Point the browser at a destination (from the path input)."""
+        path = self._normalize_destination(path)
+        if path == self._destination:
+            return
+        self._destination = path
+        self._refresh()
+
+    def _refresh(self) -> None:
+        """Resolve and list the destination without blocking the UI."""
+        sftp_client = self._sftp_client
+        if sftp_client is None and self._app is not None:
+            sftp_client = getattr(self._app, "_remote_sftp_client", None)
+
+        if sftp_client is None:
+            self._path = self._destination
+            self._note = ""
+            self._home_canonical = None
+            self._entries = [("<Not Connected>", False)]
+            self._update_table()
+            return
+
+        destination = self._destination
+
+        # Guard against stale results when refreshes overlap
+        self._refresh_generation += 1
+        generation = self._refresh_generation
+
+        def on_resolved(
+            path: str, entries: list, note: str, home_canonical: str | None
+        ) -> None:
+            if generation == self._refresh_generation:
+                self._path = path
+                self._entries = []
+                if path in ("~", ".", ""):
+                    # '..' is always offered at home; when home has no
+                    # parent above it, selecting it explains why.
+                    self._home_canonical = home_canonical
+                    self._entries.append(("..", True))
+                else:
+                    self._home_canonical = None
+                    if path != "/":
+                        # Add parent directory entry; '/' is the root
+                        self._entries.append(("..", True))
+                self._entries.extend(entries)
+                self._note = note
+                self._update_table()
+
+        def on_error(message: str) -> None:
+            if generation == self._refresh_generation:
+                self._path = destination
+                self._note = ""
+                self._home_canonical = None
+                self._entries = [(message, False)]
+                self._update_table()
+
+        self.run_worker(
+            partial(
+                self._resolve_listing,
+                sftp_client,
+                destination,
+                on_resolved,
+                on_error,
+            ),
+            thread=True,
+        )
+
+    def set_connect_state(
+        self, status: str, detail: str, device_name: str | None = None
+    ) -> None:
+        """Mirror the app's connection state in the listing.
+
+        'connecting' and 'failed' show a static message; 'idle' falls
+        back to the normal refresh (a listing when a client exists,
+        '<Not Connected>' otherwise). A live listing for the same
+        device is kept while a reconnect (e.g. the Refresh button) is
+        in flight.
+        """
+        if status == "idle":
+            self._refresh()
+            return
+        if status == "connecting":
+            current = getattr(self._sftp_client, "device", None)
+            if current is not None and (
+                device_name is None or device_name == current.name
+            ):
+                return
+        self._path = self._destination
+        self._note = ""
+        self._home_canonical = None
+        self._entries = [(detail, False)]
+        self._update_table()
+
+    def _resolve_listing(
+        self,
+        sftp_client: Any,
+        destination: str,
+        on_resolved: Any,
+        on_error: Any,
+    ) -> None:
+        """Find and list the destination's deepest existing directory."""
+        current = (
+            self._app._remote_sftp_client if self._app is not None else sftp_client
+        )
+        if sftp_client is not current:
+            # The device was switched while this refresh was in flight.
+            return
+        try:
+            path, entries, note = self._find_listing(sftp_client, destination)
+            home_canonical: str | None = None
+            if path in ("~", ".", "", "/"):
+                home_canonical = sftp_client.canonicalize(".")
+            if (
+                note == ""
+                and path in ("~", ".", "", "/")
+                and home_canonical == "/"
+            ):
+                # Home *is* the root of this remote's filesystem
+                # namespace; say so instead of looking empty.
+                note = "  [home is root]"
+        except Exception as e:
+            # A dropped connection (paramiko SSHException), a TransferError,
+            # or anything else the remote throws must surface as an entry,
+            # never as a worker crash.
+            self.call_later(on_error, _error_message(e))
+            return
+        self.call_later(on_resolved, path, entries, note, home_canonical)
+
+    @staticmethod
+    def _find_listing(
+        sftp_client: Any, destination: str
+    ) -> tuple[str, list[tuple[str, bool]], str]:
+        """Return (listing_path, entries, note) for a destination.
+
+        If the destination itself is a directory it is listed directly.
+        Otherwise the walk goes up to the nearest existing directory,
+        which is listed instead, with a note explaining the difference:
+        '[file]' for an existing file destination, '[will be created]'
+        for a missing one, '[not accessible]' when the destination is
+        access-denied or no ancestor can be listed at all (jailed or
+        permission-limited remote).
+        """
+        dest = RemoteDestinationBrowser._normalize_destination(destination)
+        dest_state = sftp_client.probe_remote(dest)
+        if dest_state == "dir":
+            return dest, sftp_client.list_remote_dir(dest), ""
+
+        listing = dest
+        state = dest_state
+        while state != "dir":
+            parent = remote_parent(listing)
+            if parent is None or parent == listing:
+                break
+            listing = parent
+            state = sftp_client.probe_remote(listing)
+
+        if state != "dir":
+            return listing, [], "  [not accessible]"
+
+        if dest_state == "file":
+            note = "  [file]"
+        elif dest_state == "denied":
+            note = "  [not accessible]"
+        else:
+            note = "  [will be created]"
+        return listing, sftp_client.list_remote_dir(listing), note
+
+    # Shared path algebra (also used by RemoteFileBrowser); kept here
+    # as an alias for backward compatibility with tests.
+    _parent_remote = staticmethod(remote_parent)
+
+    @staticmethod
+    def _join(path: str, name: str) -> str:
+        """Join a remote path and an entry name, preserving '~' form.
+
+        The home root ('~', '.' or '') yields a home-relative '~/name'.
+        """
+        if path in ("", "~", "."):
+            return f"~/{name}"
+        return str(Path(path) / name)
+
+    def _navigate(self, new_destination: str) -> None:
+        """Set the destination from a navigation action and report it."""
+        if new_destination == self._destination:
+            return
+        self._destination = new_destination
+        if self._on_destination is not None:
+            self._on_destination(new_destination)
+        self._refresh()
+
+    def _update_table(self) -> None:
+        """Update the DataTable with current entries."""
+        table = self.query_one("#destination-file-table", DataTable)
+        table.clear()
+
+        if not table.columns:
+            self._name_column_key = table.add_column("Name")
+
+        for name, _ in self._entries:
+            table.add_row(name, key=name)
+
+        display_path = self._destination if self._destination != "." else "~"
+        # A Text object keeps the path and note literal; a markup string
+        # would interpret '[' as a style tag.
+        label = Text()
+        label.append("Remote Path: ", style="bold")
+        label.append(display_path + self._note)
+        self.query_one("#destination-path-label", Label).update(label)
+
+    def action_navigate_down(self) -> None:
+        """Navigate selection down."""
+        table = self.query_one("#destination-file-table", DataTable)
+        table.action_cursor_down()
+
+    def action_navigate_up(self) -> None:
+        """Navigate selection up."""
+        table = self.query_one("#destination-file-table", DataTable)
+        table.action_cursor_up()
+
+    def action_select(self) -> None:
+        """Select current entry via keyboard."""
+        table = self.query_one("#destination-file-table", DataTable)
+        if table.cursor_row is not None:
+            row_index = table.cursor_row
+            if 0 <= row_index < len(self._entries):
+                name, _ = self._entries[row_index]
+                self._handle_selection(name)
+
+    def action_refresh(self) -> None:
+        """Refresh the destination listing."""
+        self._refresh()
+        self.app.notify("Destination refreshed")
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Handle row selection in the destination table."""
+        self._handle_selection(str(event.row_key.value))
+        event.stop()
+
+    def on_data_table_cell_selected(self, event: DataTable.CellSelected) -> None:
+        """Handle cell selection in the destination table."""
+        self._handle_selection(str(event.cell_key.row_key.value))
+        event.stop()
+
+    def _handle_selection(self, name: str) -> None:
+        """Process selection of an entry: it becomes the new destination.
+
+        Directories and files alike - a file destination overwrites that
+        exact remote file at send time. ".." goes to the parent of the
+        directory currently listed.
+        """
+        if not any(entry[0] == name for entry in self._entries):
+            return
+
+        if name == "..":
+            if self._path in ("~", ".", ""):
+                canonical = self._home_canonical
+                parent = remote_parent(canonical) if canonical else None
+                if parent is None:
+                    _notify_no_parent_above_home(self, canonical)
+                    return
+            else:
+                parent = remote_parent(self._path)
+                if parent is None:
+                    return
+            self._navigate(parent)
+        else:
+            self._navigate(self._join(self._path, name))
 
     def on_click(self, event: events.Click) -> None:
         """Handle click events to select entries."""
@@ -614,11 +1093,30 @@ class TailshareApp(App[None]):
         text-style: bold;
     }
 
-    #file-browser-container {
+    #browser-row {
         height: 2fr;
+        width: 100%;
+    }
+
+    #local-browser-column,
+    #destination-column {
+        width: 1fr;
+        height: 1fr;
+    }
+
+    #file-browser-container {
+        height: 1fr;
     }
 
     #file-table {
+        height: 1fr;
+    }
+
+    #remote-destination-container {
+        height: 1fr;
+    }
+
+    #destination-file-table {
         height: 1fr;
     }
 
@@ -685,11 +1183,14 @@ class TailshareApp(App[None]):
         self._selected_device_name: str | None = None
         self._selected_path: str = ""
         self._selected_remote_path: str = ""
+        self._remote_destination: str = "~"
         self._worker_running = False
         self._worker_lock = threading.Lock()
         self._queue_update_enabled: bool = False
         self._interval_token: Any = None
         self._remote_sftp_client: Any = None
+        self._connect_in_progress: bool = False
+        self._last_connect_error: str | None = None
 
     def compose(self) -> ComposeResult:
         """Compose the UI layout."""
@@ -715,9 +1216,23 @@ class TailshareApp(App[None]):
 
             with TabbedContent(id="transfer-tabs"):
                 with TabPane("Send", id="send-tab"), Vertical(id="right-panel"):
-                    yield Label("[b]File Browser[/b]", id="file-header")
-                    with ScrollableContainer(id="file-browser-container"):
-                        yield FileBrowser(id="file-browser", path="/")
+                    with Horizontal(id="browser-row"):
+                        with Vertical(id="local-browser-column"):
+                            yield Label("[b]File Browser[/b]", id="file-header")
+                            with ScrollableContainer(id="file-browser-container"):
+                                yield FileBrowser(id="file-browser", path="/")
+                        with Vertical(id="destination-column"):
+                            yield Label(
+                                "[b]Destination[/b]", id="destination-header"
+                            )
+                            with ScrollableContainer(
+                                id="remote-destination-container"
+                            ):
+                                yield RemoteDestinationBrowser(
+                                    id="remote-destination",
+                                    app=self,
+                                    on_destination=self._on_destination_changed,
+                                )
 
                     yield Static(id="path-spacer")
 
@@ -775,6 +1290,11 @@ class TailshareApp(App[None]):
         if event.key == "escape":
             self.query_one("#remote-path", Input).value = ""
             self.query_one("#local-path", Input).value = ""
+            # Reset the destination to the default and point the browser back
+            self._remote_destination = "~"
+            self.query_one("#remote-destination", RemoteDestinationBrowser).set_destination(
+                "~"
+            )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle button presses."""
@@ -855,6 +1375,34 @@ class TailshareApp(App[None]):
                 title="File Selected",
             )
 
+    def _on_destination_changed(self, path: str) -> None:
+        """Destination browser moved; mirror it into the path input."""
+        self._remote_destination = path
+        self.query_one("#remote-path", Input).value = path
+
+    def _commit_remote_path_input(self) -> None:
+        """Commit the remote path input's value to the destination."""
+        value = RemoteDestinationBrowser._normalize_destination(
+            self.query_one("#remote-path", Input).value
+        )
+        if value == self._remote_destination:
+            return
+        self._remote_destination = value
+        self.query_one("#remote-path", Input).value = value
+        self.query_one("#remote-destination", RemoteDestinationBrowser).set_destination(
+            value
+        )
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Commit the remote path when Enter is pressed in the input."""
+        if event.input.id == "remote-path":
+            self._commit_remote_path_input()
+
+    def on_input_blurred(self, event: Input.Blurred) -> None:
+        """Commit the remote path when the input loses focus."""
+        if event.input.id == "remote-path":
+            self._commit_remote_path_input()
+
     def action_refresh_devices(self) -> None:
         """Refresh device list."""
         self._refresh_device_list()
@@ -873,9 +1421,9 @@ class TailshareApp(App[None]):
         self._fetch_files()
 
     def action_refresh_remote(self) -> None:
-        """Refresh remote file browser."""
-        browser = self.query_one("#remote-file-browser", RemoteFileBrowser)
-        browser.action_refresh()
+        """Refresh both remote browsers (fetch source and send destination)."""
+        self.query_one("#remote-file-browser", RemoteFileBrowser).action_refresh()
+        self.query_one("#remote-destination", RemoteDestinationBrowser).action_refresh()
 
     def action_clear_queue(self) -> None:
         """Clear completed transfers."""
@@ -1022,14 +1570,16 @@ class TailshareApp(App[None]):
             )
             return
 
-        # Get credentials and remote path
+        # Get credentials and remote path. Commit the input first so the
+        # destination browser and state agree even if the blur has not
+        # been processed yet (Send pressed right after typing), then use
+        # the canonical (normalized) destination.
+        self._commit_remote_path_input()
+
         user = self.query_one("#remote-user", Input).value.strip() or None
         password = self.query_one("#remote-password", Input).value.strip() or None
 
-        remote_path_input = self.query_one("#remote-path", Input)
-        remote_path = remote_path_input.value.strip()
-        if not remote_path:
-            remote_path = "~"
+        remote_path = self._remote_destination
 
         # Queue the transfer
         try:
@@ -1137,6 +1687,10 @@ class TailshareApp(App[None]):
         user = self.query_one("#remote-user", Input).value.strip() or None
         password = self.query_one("#remote-password", Input).value.strip() or None
 
+        self._connect_in_progress = True
+        self._last_connect_error = None
+        self._publish_connect_state()
+
         # The SSH connection is blocking; run it off the UI thread.
         self.run_worker(
             partial(self._connect_in_thread, device, user, password),
@@ -1146,19 +1700,36 @@ class TailshareApp(App[None]):
     def _connect_in_thread(
         self, device: Device, user: str | None, password: str | None
     ) -> None:
-        """Connect in a background thread and hand the client back."""
+        """Connect in a background thread and hand the client back.
+
+        Any failure - TransferError or otherwise - is reported to the
+        main thread as a visible state; an unhandled worker exception
+        would take the whole app down.
+        """
         client = SFTPClient(device)
         try:
             client.connect(username=user, password=password)
-        except TransferError as e:
-            msg = f"Cannot connect to {device.name}: {e}"
-            self.call_later(
-                lambda: self.notify(
-                    msg, title="Connection Failed", severity="error"
-                )
-            )
+        except Exception as e:
+            client.disconnect()
+            reason = str(e).strip() or type(e).__name__
+            self.call_later(self._on_connect_failed, device, reason)
             return
         self.call_later(self._adopt_remote_client, client)
+
+    def _on_connect_failed(self, device: Device, reason: str) -> None:
+        """Record a failed connection attempt (main thread)."""
+        if (
+            self._selected_device is not None
+            and device.ip != self._selected_device.ip
+        ):
+            # A newer selection owns the connection state now.
+            return
+        self._connect_in_progress = False
+        self._last_connect_error = f"Cannot connect to {device.name}: {reason}"
+        self.notify(
+            self._last_connect_error, title="Connection Failed", severity="error"
+        )
+        self._publish_connect_state()
 
     def _adopt_remote_client(self, client: SFTPClient) -> None:
         """Install a connected client, releasing the previous one (main thread)."""
@@ -1177,9 +1748,44 @@ class TailshareApp(App[None]):
             self._remote_sftp_client.disconnect()
 
         self._remote_sftp_client = client
+        self._connect_in_progress = False
+        self._last_connect_error = None
+
         remote_browser = self.query_one("#remote-file-browser", RemoteFileBrowser)
         remote_browser._sftp_client = client
-        remote_browser._refresh_entries()
+
+        destination_browser = self.query_one(
+            "#remote-destination", RemoteDestinationBrowser
+        )
+        destination_browser._sftp_client = client
+
+        self._publish_connect_state()
+
+    def _publish_connect_state(self) -> None:
+        """Push the connection state to both remote browsers (main thread).
+
+        While a connection is in flight the browsers say so; after a
+        failure they keep showing the reason (a toast alone is easy to
+        miss); otherwise they refresh normally (a listing when a client
+        exists, '<Not Connected>' when none does).
+        """
+        name = self._selected_device.name if self._selected_device else None
+        if self._connect_in_progress:
+            status = "connecting"
+            detail = f"Connecting to {name or 'device'}..."
+        elif self._last_connect_error:
+            status = "failed"
+            detail = self._last_connect_error
+        else:
+            status = "idle"
+            detail = ""
+
+        self.query_one("#remote-file-browser", RemoteFileBrowser).set_connect_state(
+            status, detail, name
+        )
+        self.query_one(
+            "#remote-destination", RemoteDestinationBrowser
+        ).set_connect_state(status, detail, name)
 
     def _execute_transfers(self) -> None:
         """Execute queued transfers in background (runs in worker thread).

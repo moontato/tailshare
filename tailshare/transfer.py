@@ -7,6 +7,7 @@ This module handles:
 - Error handling and retry logic
 """
 
+import errno
 import logging
 import os
 import stat
@@ -186,6 +187,12 @@ class SFTPClient:
         self._device = device
         self._ssh_client: paramiko.SSHClient | None = None
         self._sftp_client: paramiko.SFTPClient | None = None
+        # paramiko's SFTPClient is not thread-safe: concurrent requests
+        # from multiple threads desynchronize its request/response
+        # matching and kill the connection. Every operation that goes
+        # through the client's primary channel is serialized here.
+        # (An RLock, because public methods call each other.)
+        self._sftp_lock = threading.RLock()
         self._logger = logging.getLogger(__name__)
         self._config = get_config()
 
@@ -241,7 +248,8 @@ class SFTPClient:
                 **auth_kwargs,
             )
 
-            self._sftp_client = self._ssh_client.open_sftp()
+            with self._sftp_lock:
+                self._sftp_client = self._ssh_client.open_sftp()
 
             self._logger.info(
                 f"Connected to {self._device.name} at {self._device.ip}"
@@ -264,12 +272,13 @@ class SFTPClient:
 
     def disconnect(self) -> None:
         """Close SSH/SFTP connections."""
-        if self._sftp_client:
-            self._sftp_client.close()
-            self._sftp_client = None
-        if self._ssh_client:
-            self._ssh_client.close()
-            self._ssh_client = None
+        with self._sftp_lock:
+            if self._sftp_client:
+                self._sftp_client.close()
+                self._sftp_client = None
+            if self._ssh_client:
+                self._ssh_client.close()
+                self._ssh_client = None
 
     def is_remote_dir(self, path: str) -> bool | None:
         """Check whether a remote path is a directory.
@@ -290,11 +299,74 @@ class SFTPClient:
             path = path.replace("~", ".", 1)
 
         try:
-            stat_result = self._sftp_client.stat(path)
+            with self._sftp_lock:
+                stat_result = self._sftp_client.stat(path)
         except OSError:
             return None
 
         return stat.S_ISDIR(stat_result.st_mode)
+
+    def probe_remote(self, path: str) -> str:
+        """Probe a remote path and classify what it is.
+
+        Unlike is_remote_dir this distinguishes "missing" from
+        "access denied", so callers can tell a genuinely absent path
+        (safe to create) apart from one the session may not reach
+        (permission denied, chroot-jailed namespace, ...).
+
+        Args:
+            path: Remote path to probe ('~' expands to the home directory)
+
+        Returns:
+            One of 'dir', 'file', 'denied', 'missing', 'unavailable'
+        """
+        if not self._sftp_client:
+            return "unavailable"
+
+        if path == "~":
+            path = "."
+        elif path.startswith("~"):
+            path = path.replace("~", ".", 1)
+
+        try:
+            with self._sftp_lock:
+                stat_result = self._sftp_client.stat(path)
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EPERM):
+                return "denied"
+            return "missing"
+
+        return "dir" if stat.S_ISDIR(stat_result.st_mode) else "file"
+
+    def canonicalize(self, path: str) -> str | None:
+        """Resolve a remote path to its canonical absolute form.
+
+        Uses the server's REALPATH (paramiko's SFTPClient.normalize);
+        '.' resolves to the session's home directory, which on a
+        chroot-jailed SFTP account is the jail root '/'.
+
+        Best effort: returns None when not connected or the server
+        cannot resolve the path, so callers can degrade gracefully.
+
+        Args:
+            path: Remote path to resolve ('~' expands to the home directory)
+
+        Returns:
+            The canonical absolute path (e.g. '/home/user' for '.'), or None
+        """
+        if not self._sftp_client:
+            return None
+
+        if path == "~":
+            path = "."
+        elif path.startswith("~"):
+            path = path.replace("~", ".", 1)
+
+        try:
+            with self._sftp_lock:
+                return self._sftp_client.normalize(path)
+        except Exception:
+            return None
 
     def transfer_file(
         self,
@@ -350,7 +422,8 @@ class SFTPClient:
 
         # If target_path is a directory, append the filename to it
         try:
-            sftp_stat = self._sftp_client.stat(target_path)
+            with self._sftp_lock:
+                sftp_stat = self._sftp_client.stat(target_path)
             if stat.S_ISDIR(sftp_stat.st_mode):
                 target_path = os.path.join(target_path, os.path.basename(source_path))
                 self._logger.info(f"Target is directory, updating path to: {target_path}")
@@ -365,7 +438,8 @@ class SFTPClient:
         self._logger.info(f"SFTP PUT: {source_path} -> {target_path}")
 
         transferred = 0
-        remote_file = self._sftp_client.file(target_path, "wb")
+        with self._sftp_lock:
+            remote_file = self._sftp_client.file(target_path, "wb")
         try:
             with open(source_path, "rb") as local_file:
                 while True:
@@ -385,7 +459,8 @@ class SFTPClient:
         except TransferCancelled:
             # Do not leave a half-written file on the remote host.
             try:
-                self._sftp_client.unlink(target_path)
+                with self._sftp_lock:
+                    self._sftp_client.unlink(target_path)
             except OSError as e:
                 self._logger.debug(
                     f"Could not remove partial remote file {target_path}: {e}"
@@ -528,8 +603,12 @@ class SFTPClient:
             path = path.replace("~", ".", 1)
 
         try:
+            # listdir_attr() iterates lazily: hold the lock for the
+            # whole iteration, not just the first request.
+            with self._sftp_lock:
+                attrs = list(self._sftp_client.listdir_attr(path))
             entries = []
-            for attr in self._sftp_client.listdir_attr(path):
+            for attr in attrs:
                 name = attr.filename
                 is_dir = stat.S_ISDIR(attr.st_mode)
                 entries.append((name, is_dir))
@@ -584,7 +663,8 @@ class SFTPClient:
 
         # Get remote file info
         try:
-            remote_stat = self._sftp_client.stat(source_path)
+            with self._sftp_lock:
+                remote_stat = self._sftp_client.stat(source_path)
 
         except OSError as e:
             raise TransferError(f"Remote file not found: {source_path}: {e}") from e
@@ -602,7 +682,8 @@ class SFTPClient:
 
         self._logger.info(f"SFTP GET: {source_path} -> {target_path}")
 
-        remote_file = self._sftp_client.file(source_path, "rb")
+        with self._sftp_lock:
+            remote_file = self._sftp_client.file(source_path, "rb")
         try:
             with open(target_path, "wb") as local_file:
                 while True:
@@ -726,7 +807,8 @@ class SFTPClient:
             return
 
         try:
-            self._sftp_client.stat(path)
+            with self._sftp_lock:
+                self._sftp_client.stat(path)
         except (OSError, FileNotFoundError):
             # Create parent directories first
             parent = os.path.dirname(path)
@@ -734,7 +816,8 @@ class SFTPClient:
                 self._ensure_remote_dir(parent)
 
             try:
-                self._sftp_client.mkdir(path)
+                with self._sftp_lock:
+                    self._sftp_client.mkdir(path)
             except OSError as e:
                 self._logger.debug(f"mkdir failed for {path}: {e}")
                 # It might already exist or be a file; we'll let put() fail if so
