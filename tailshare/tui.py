@@ -359,6 +359,30 @@ class RemoteFileBrowser(Vertical):
             thread=True,
         )
 
+    def set_connect_state(
+        self, status: str, detail: str, device_name: str | None = None
+    ) -> None:
+        """Mirror the app's connection state in the listing.
+
+        'connecting' and 'failed' show a static message; 'idle' falls
+        back to the normal refresh (a listing when a client exists,
+        '<Not Connected>' otherwise). A live listing for the same
+        device is kept while a reconnect (e.g. the Refresh button) is
+        in flight.
+        """
+        if status == "idle":
+            self._refresh_entries()
+            return
+        if status == "connecting":
+            current = getattr(self._sftp_client, "device", None)
+            if current is not None and (
+                device_name is None or device_name == current.name
+            ):
+                return
+        self._home_canonical = None
+        self._entries = [(detail, False)]
+        self._update_table()
+
     def _list_remote_dir(
         self,
         sftp_client: Any,
@@ -659,6 +683,32 @@ class RemoteDestinationBrowser(Vertical):
             ),
             thread=True,
         )
+
+    def set_connect_state(
+        self, status: str, detail: str, device_name: str | None = None
+    ) -> None:
+        """Mirror the app's connection state in the listing.
+
+        'connecting' and 'failed' show a static message; 'idle' falls
+        back to the normal refresh (a listing when a client exists,
+        '<Not Connected>' otherwise). A live listing for the same
+        device is kept while a reconnect (e.g. the Refresh button) is
+        in flight.
+        """
+        if status == "idle":
+            self._refresh()
+            return
+        if status == "connecting":
+            current = getattr(self._sftp_client, "device", None)
+            if current is not None and (
+                device_name is None or device_name == current.name
+            ):
+                return
+        self._path = self._destination
+        self._note = ""
+        self._home_canonical = None
+        self._entries = [(detail, False)]
+        self._update_table()
 
     def _resolve_listing(
         self,
@@ -1139,6 +1189,8 @@ class TailshareApp(App[None]):
         self._queue_update_enabled: bool = False
         self._interval_token: Any = None
         self._remote_sftp_client: Any = None
+        self._connect_in_progress: bool = False
+        self._last_connect_error: str | None = None
 
     def compose(self) -> ComposeResult:
         """Compose the UI layout."""
@@ -1635,6 +1687,10 @@ class TailshareApp(App[None]):
         user = self.query_one("#remote-user", Input).value.strip() or None
         password = self.query_one("#remote-password", Input).value.strip() or None
 
+        self._connect_in_progress = True
+        self._last_connect_error = None
+        self._publish_connect_state()
+
         # The SSH connection is blocking; run it off the UI thread.
         self.run_worker(
             partial(self._connect_in_thread, device, user, password),
@@ -1644,19 +1700,36 @@ class TailshareApp(App[None]):
     def _connect_in_thread(
         self, device: Device, user: str | None, password: str | None
     ) -> None:
-        """Connect in a background thread and hand the client back."""
+        """Connect in a background thread and hand the client back.
+
+        Any failure - TransferError or otherwise - is reported to the
+        main thread as a visible state; an unhandled worker exception
+        would take the whole app down.
+        """
         client = SFTPClient(device)
         try:
             client.connect(username=user, password=password)
-        except TransferError as e:
-            msg = f"Cannot connect to {device.name}: {e}"
-            self.call_later(
-                lambda: self.notify(
-                    msg, title="Connection Failed", severity="error"
-                )
-            )
+        except Exception as e:
+            client.disconnect()
+            reason = str(e).strip() or type(e).__name__
+            self.call_later(self._on_connect_failed, device, reason)
             return
         self.call_later(self._adopt_remote_client, client)
+
+    def _on_connect_failed(self, device: Device, reason: str) -> None:
+        """Record a failed connection attempt (main thread)."""
+        if (
+            self._selected_device is not None
+            and device.ip != self._selected_device.ip
+        ):
+            # A newer selection owns the connection state now.
+            return
+        self._connect_in_progress = False
+        self._last_connect_error = f"Cannot connect to {device.name}: {reason}"
+        self.notify(
+            self._last_connect_error, title="Connection Failed", severity="error"
+        )
+        self._publish_connect_state()
 
     def _adopt_remote_client(self, client: SFTPClient) -> None:
         """Install a connected client, releasing the previous one (main thread)."""
@@ -1675,15 +1748,44 @@ class TailshareApp(App[None]):
             self._remote_sftp_client.disconnect()
 
         self._remote_sftp_client = client
+        self._connect_in_progress = False
+        self._last_connect_error = None
+
         remote_browser = self.query_one("#remote-file-browser", RemoteFileBrowser)
         remote_browser._sftp_client = client
-        remote_browser._refresh_entries()
 
         destination_browser = self.query_one(
             "#remote-destination", RemoteDestinationBrowser
         )
         destination_browser._sftp_client = client
-        destination_browser._refresh()
+
+        self._publish_connect_state()
+
+    def _publish_connect_state(self) -> None:
+        """Push the connection state to both remote browsers (main thread).
+
+        While a connection is in flight the browsers say so; after a
+        failure they keep showing the reason (a toast alone is easy to
+        miss); otherwise they refresh normally (a listing when a client
+        exists, '<Not Connected>' when none does).
+        """
+        name = self._selected_device.name if self._selected_device else None
+        if self._connect_in_progress:
+            status = "connecting"
+            detail = f"Connecting to {name or 'device'}..."
+        elif self._last_connect_error:
+            status = "failed"
+            detail = self._last_connect_error
+        else:
+            status = "idle"
+            detail = ""
+
+        self.query_one("#remote-file-browser", RemoteFileBrowser).set_connect_state(
+            status, detail, name
+        )
+        self.query_one(
+            "#remote-destination", RemoteDestinationBrowser
+        ).set_connect_state(status, detail, name)
 
     def _execute_transfers(self) -> None:
         """Execute queued transfers in background (runs in worker thread).

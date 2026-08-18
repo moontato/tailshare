@@ -18,7 +18,7 @@ import pytest
 import tailshare.config as config_module
 from tailshare.devices import Device
 from tailshare.transfer import SFTPClient
-from tailshare.tui import RemoteDestinationBrowser, remote_parent
+from tailshare.tui import RemoteDestinationBrowser, TailshareApp, remote_parent
 
 
 class _AuthServer(paramiko.ServerInterface):
@@ -224,3 +224,115 @@ def test_real_server_missing_path_probe(tmp_path) -> None:
         assert client.probe_remote("nope") == "missing"
     finally:
         sftp.close()
+
+
+def test_concurrent_sftp_operations_do_not_desync(tmp_path) -> None:
+    """Many threads sharing one SFTPClient must not kill the session.
+
+    paramiko's SFTPClient is not thread-safe: concurrent requests
+    desynchronize its request/response matching, so one thread steals
+    another's reply and the connection dies ('Server connection
+    dropped'). The TUI hits exactly this: both remote browsers refresh
+    in parallel on separate threads against one shared client.
+    """
+    home = _build_home(tmp_path)
+    port, _ = _start_sftp_server(home, jailed=False)
+    sftp = _connect(port)
+    try:
+        client = SFTPClient(make_device())
+        client._sftp_client = sftp
+        errors: list[Exception] = []
+
+        def hammer() -> None:
+            try:
+                for _ in range(20):
+                    assert client.probe_remote("docs") == "dir"
+                    entries = client.list_remote_dir("~")
+                    assert ("report.txt", False) in entries
+                    assert client.canonicalize(".") == home
+            except Exception as e:  # pragma: no cover - failure path
+                errors.append(e)
+
+        threads = [threading.Thread(target=hammer) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+
+        assert not any(t.is_alive() for t in threads), (
+            "worker threads hung: the SFTP session desynced"
+        )
+        assert not errors, errors
+        # The session must still be usable afterwards.
+        assert client.probe_remote("report.txt") == "file"
+    finally:
+        sftp.close()
+
+
+async def _wait_until(pilot, predicate, attempts: int = 200) -> bool:
+    for _ in range(attempts):
+        if predicate():
+            return True
+        await pilot.pause()
+    return False
+
+
+def _rows(table) -> list[str]:
+    return [table.get_cell_at((i, 0)) for i in range(table.row_count)]
+
+
+async def test_full_app_flow_over_real_sftp(tmp_path, monkeypatch) -> None:
+    """The entire app, end to end, against a live SFTP server.
+
+    A real TailshareApp with a real SFTPClient (real paramiko, real SFTP
+    protocol over a socket) selects a device, connects, and both remote
+    browsers must list the server's home directory. This is the closest
+    a test can get to the user's actual 'pick a device and it should
+    list files' flow, and it fails if any part of the connect -> adopt
+    -> refresh pipeline is broken.
+    """
+    from textual.widgets import DataTable
+
+    home = _build_home(tmp_path)
+    port, _ = _start_sftp_server(home, jailed=False)
+
+    # Point the real SFTPClient's connect() at the live in-process server.
+    def real_connect(
+        self, username: str | None = None, password: str | None = None
+    ) -> None:
+        self._sftp_client = _connect(port)
+
+    monkeypatch.setattr(SFTPClient, "connect", real_connect)
+
+    device = make_device()
+    app = TailshareApp()
+    monkeypatch.setattr(app._device_discovery, "discover", lambda: [device])
+    monkeypatch.setattr(app._device_discovery, "get_devices", lambda: [device])
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        device_list = app.query_one("#device-list", DataTable)
+        assert await _wait_until(pilot, lambda: device_list.row_count == 1)
+
+        app._select_device_by_key("m-real")
+        assert await _wait_until(
+            pilot, lambda: app._remote_sftp_client is not None
+        )
+
+        dest_table = app.query_one("#destination-file-table", DataTable)
+        fetch_table = app.query_one("#remote-file-table", DataTable)
+
+        def both_listed() -> bool:
+            return (
+                "docs" in _rows(dest_table)
+                and "report.txt" in _rows(dest_table)
+                and "docs" in _rows(fetch_table)
+                and "report.txt" in _rows(fetch_table)
+            )
+
+        assert await _wait_until(pilot, both_listed), (
+            f"destination={_rows(dest_table)} fetch={_rows(fetch_table)}"
+        )
+
+        await pilot.press("q")
+        await pilot.pause()

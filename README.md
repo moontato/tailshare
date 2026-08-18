@@ -55,6 +55,8 @@ tailshare --version
 3. Optionally enter the remote **username** and **password** in the inputs below the device list. Leave both empty to use your local username and SSH key/agent authentication.
 4. Press **Refresh** to rediscover devices and (re)connect the remote browser, or **Test** to check SSH connectivity to the selected device.
 
+While a connection is in flight both remote browsers show `Connecting to <device>...`. If the connection fails they keep showing `Cannot connect to <device>: <reason>` until you pick a device again — so a failed or missing connection is always visible, never just an empty `<Not Connected>` panel.
+
 ### Sending files (Send tab)
 
 1. Pick a device first — the **Destination** browser (right-hand panel) connects automatically and lists the remote home directory. It sits side-by-side with the local file browser so you can see both ends at once.
