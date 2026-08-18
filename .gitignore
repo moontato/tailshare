@@ -15,6 +15,7 @@ build/
 # Virtual environments
 venv/
 .venv/
+.venv2/
 env/
 .env/
 */venv/
@@ -55,6 +56,9 @@ Thumbs.db
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Ruff
+.ruff_cache/
 
 # Pyre type checker
 .pyre/
