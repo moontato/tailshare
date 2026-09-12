@@ -1094,7 +1094,7 @@ class TailshareApp(App[None]):
     }
 
     #browser-row {
-        height: 2fr;
+        height: 4fr;
         width: 100%;
     }
 
@@ -1125,7 +1125,7 @@ class TailshareApp(App[None]):
     }
 
     #transfer-queue-container {
-        height: 4fr;
+        height: 2fr;
     }
 
     #transfer-queue {
@@ -1133,7 +1133,7 @@ class TailshareApp(App[None]):
     }
 
     #remote-file-browser-container {
-        height: 2fr;
+        height: 4fr;
     }
 
     #remote-file-table {
@@ -1145,7 +1145,7 @@ class TailshareApp(App[None]):
     }
 
     #transfer-queue-container-fetch {
-        height: 4fr;
+        height: 2fr;
     }
 
     #transfer-queue-fetch {
