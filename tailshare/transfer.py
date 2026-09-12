@@ -257,6 +257,12 @@ class SFTPClient:
 
         except paramiko.SSHException as e:
             raise TransferError(f"SSH connection failed: {e}") from e
+        except EOFError as e:
+            raise TransferError(
+                f"Connection to {self._device.ip} was closed unexpectedly "
+                f"(EOF). The remote server may have dropped the connection "
+                f"during the SSH handshake: {e}"
+            ) from e
         except ConnectionRefusedError as err:
             raise TransferError(
                 f"Connection refused by {self._device.ip}. "
@@ -1004,10 +1010,23 @@ class TransferManager:
                             username=first_task.username,
                             password=first_task.password
                         )
-                    except TransferError as e:
-                        self._logger.error(f"Connection failed for {device.name}: {e}")
+                    except (TransferError, EOFError) as e:
+                        if isinstance(e, EOFError):
+                            self._logger.error(
+                                f"Connection failed for {device.name}: "
+                                f"Remote closed connection unexpectedly: {e}"
+                            )
+                            err_msg = (
+                                "Connection failed: "
+                                "Remote closed connection unexpectedly"
+                            )
+                        else:
+                            self._logger.error(
+                                f"Connection failed for {device.name}: {e}"
+                            )
+                            err_msg = str(e)
                         for task in tasks:
-                            task.fail(f"Connection failed: {e}")
+                            task.fail(err_msg)
                         continue
 
                     for task in tasks:
