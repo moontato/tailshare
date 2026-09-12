@@ -1450,13 +1450,26 @@ class TailshareApp(App[None]):
             devices = self._device_discovery.discover()
 
             rows = []
-            for device in devices:
+            # Online devices first, then offline; alphabetical by name within
+            # each group. Offline devices stay listed and selectable but are
+            # dimmed so the reachable set stands out.
+            ordered = sorted(
+                devices,
+                key=lambda d: (0 if d.online else 1, d.name.lower()),
+            )
+            for device in ordered:
                 status = "Online" if device.online else "Offline"
-                style_prefix = ""
-                style_suffix = ""
                 if self._selected_device_name == device.name:
+                    # Selection highlight wins over the offline dim so a
+                    # selected device that drops offline stays unambiguous.
                     style_prefix = "[background=$primary][color=$text][b]"
                     style_suffix = "[/]"
+                elif device.online:
+                    style_prefix = ""
+                    style_suffix = ""
+                else:
+                    style_prefix = "[dim]"
+                    style_suffix = "[/dim]"
                 # Row key must be unique per device: use the machine id
                 # (falling back to IP) so name collisions cannot crash
                 # the table with a DuplicateKey error.
